@@ -45,6 +45,8 @@ import static java.lang.Math.min;
 
 import android.annotation.SuppressLint;
 import android.content.Context;
+import android.content.res.Configuration;
+import android.graphics.Point;
 import android.graphics.Rect;
 import android.graphics.SurfaceTexture;
 import android.media.AudioDeviceInfo;
@@ -67,10 +69,14 @@ import androidx.media3.common.DeviceInfo;
 import androidx.media3.common.Effect;
 import androidx.media3.common.Format;
 import androidx.media3.common.IllegalSeekPositionException;
+import androidx.media3.common.Label;
+import androidx.media3.common.MediaChapter;
+import androidx.media3.common.MediaEdition;
 import androidx.media3.common.MediaItem;
 import androidx.media3.common.MediaLibraryInfo;
 import androidx.media3.common.MediaMetadata;
 import androidx.media3.common.Metadata;
+import androidx.media3.common.MimeTypes;
 import androidx.media3.common.PlaybackException;
 import androidx.media3.common.PlaybackParameters;
 import androidx.media3.common.Player;
@@ -109,22 +115,28 @@ import androidx.media3.exoplayer.audio.AudioSink;
 import androidx.media3.exoplayer.image.ImageOutput;
 import androidx.media3.exoplayer.metadata.MetadataOutput;
 import androidx.media3.exoplayer.source.MaskingMediaSource;
+import androidx.media3.exoplayer.source.MediaChapterProvider;
+import androidx.media3.exoplayer.source.MediaEditionProvider;
+import androidx.media3.exoplayer.source.MediaEditionSelector;
 import androidx.media3.exoplayer.source.MediaSource;
 import androidx.media3.exoplayer.source.MediaSource.MediaPeriodId;
 import androidx.media3.exoplayer.source.ShuffleOrder;
 import androidx.media3.exoplayer.source.TimelineWithUpdatedMediaItem;
 import androidx.media3.exoplayer.source.TrackGroupArray;
+import androidx.media3.exoplayer.source.WrappingMediaSource;
 import androidx.media3.exoplayer.text.TextOutput;
 import androidx.media3.exoplayer.trackselection.ExoTrackSelection;
 import androidx.media3.exoplayer.trackselection.TrackSelectionArray;
 import androidx.media3.exoplayer.trackselection.TrackSelector;
 import androidx.media3.exoplayer.trackselection.TrackSelectorResult;
 import androidx.media3.exoplayer.upstream.BandwidthMeter;
+import androidx.media3.exoplayer.video.MediaCodecVideoRenderer;
 import androidx.media3.exoplayer.video.VideoDecoderOutputBufferRenderer;
 import androidx.media3.exoplayer.video.VideoFrameMetadataListener;
 import androidx.media3.exoplayer.video.VideoRendererEventListener;
 import androidx.media3.exoplayer.video.spherical.CameraMotionListener;
 import androidx.media3.exoplayer.video.spherical.SphericalGLSurfaceView;
+import androidx.media3.extractor.metadata.Chapter;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
 import java.lang.ref.WeakReference;
@@ -142,13 +154,15 @@ import java.util.function.IntConsumer;
 
 /** The default implementation of {@link ExoPlayer}. */
 @SuppressWarnings("nullness") // TODO: b/78934030 - Add missing nullness checks to this class.
-/* package */ final class ExoPlayerImpl extends BasePlayer implements ExoPlayer {
+/* package */ final class ExoPlayerImpl extends BasePlayer
+    implements ExoPlayer, ExoPlayerDebugInfo {
 
   static {
     MediaLibraryInfo.registerModule("media3.exoplayer");
   }
 
   private static final String TAG = "ExoPlayerImpl";
+  private static final float MAX_SURFACE_BUFFER_SIZE_CHANGE_FRACTION = 0.01f;
 
   /**
    * This empty track selector result can only be used for {@link PlaybackInfo#trackSelectorResult}
@@ -212,13 +226,24 @@ import java.util.function.IntConsumer;
   private Commands availableCommands;
   private MediaMetadata mediaMetadata;
   private MediaMetadata playlistMetadata;
+  private ImmutableList<MediaChapter> currentMediaChapters = ImmutableList.of();
+  private ImmutableList<MediaEdition> currentMediaEditions = ImmutableList.of();
   @Nullable private Format videoFormat;
   @Nullable private Format audioFormat;
+  @Nullable private String videoDecoderName;
+  @Nullable private String audioDecoderName;
+  private int initializedAudioTrackCount;
+  private int initializedAudioPassthroughTrackCount;
+  private int initializedAudioOffloadTrackCount;
+  private int initializedAudioTunnelingTrackCount;
+  private int initializedAudioUnsupportedFormatTrackCount;
   @Nullable private Object videoOutput;
   @Nullable private Surface ownedSurface;
   @Nullable private SurfaceHolder surfaceHolder;
   @Nullable private SphericalGLSurfaceView sphericalGLSurfaceView;
   private boolean surfaceHolderSurfaceIsVideoOutput;
+  private Size confirmedSurfaceBufferSize = Size.UNKNOWN;
+  private Size pendingSurfaceBufferSize = Size.UNKNOWN;
   @Nullable private TextureView textureView;
   private @C.VideoScalingMode int videoScalingMode;
   private @C.VideoChangeFrameRateStrategy int videoChangeFrameRateStrategy;
@@ -228,6 +253,8 @@ import java.util.function.IntConsumer;
   private AudioAttributes audioAttributes;
   private float volume;
   private float unmuteVolume;
+  private long audioOffsetMs;
+  private long textOffsetMs;
   private boolean skipSilenceEnabled;
   private CueGroup currentCueGroup;
   @Nullable private VideoFrameMetadataListener videoFrameMetadataListener;
@@ -349,11 +376,15 @@ import java.util.function.IntConsumer;
                   COMMAND_CHANGE_MEDIA_ITEMS,
                   COMMAND_GET_TRACKS,
                   COMMAND_GET_AUDIO_ATTRIBUTES,
+                  COMMAND_GET_AUDIO_OFFSET,
+                  COMMAND_SET_AUDIO_OFFSET,
                   COMMAND_SET_AUDIO_ATTRIBUTES,
                   COMMAND_GET_VOLUME,
                   COMMAND_SET_VOLUME,
                   COMMAND_SET_VIDEO_SURFACE,
                   COMMAND_GET_TEXT,
+                  COMMAND_GET_TEXT_OFFSET,
+                  COMMAND_SET_TEXT_OFFSET,
                   COMMAND_RELEASE)
               .addIf(
                   COMMAND_SET_TRACK_SELECTION_PARAMETERS, trackSelector.isSetParametersSupported())
@@ -1360,6 +1391,48 @@ import java.util.function.IntConsumer;
   }
 
   @Override
+  public List<MediaChapter> getCurrentMediaChapters() {
+    verifyApplicationThread();
+    return currentMediaChapters;
+  }
+
+  @Override
+  public List<MediaEdition> getCurrentMediaEditions() {
+    verifyApplicationThread();
+    return currentMediaEditions;
+  }
+
+  @Override
+  public boolean selectChapter(MediaChapter chapter) {
+    verifyApplicationThread();
+    @Nullable MediaChapter currentChapter = findMediaChapter(currentMediaChapters, chapter.index);
+    if (currentChapter == null || currentChapter.timeUs == C.TIME_UNSET) {
+      return false;
+    }
+    seekTo(Util.usToMs(currentChapter.timeUs));
+    return true;
+  }
+
+  @Override
+  public boolean selectEdition(MediaEdition edition) {
+    verifyApplicationThread();
+    MediaEditionSelector selector = getCurrentSourceAs(playbackInfo, MediaEditionSelector.class);
+    @Nullable MediaEdition currentEdition = findMediaEdition(currentMediaEditions, edition.index);
+    if (selector == null || currentEdition == null) {
+      return false;
+    }
+    if (currentEdition.selected) {
+      return true;
+    }
+    updateMediaEditions(applyEditionSelection(currentMediaEditions, currentEdition.index));
+    updateMediaChapters(ImmutableList.of());
+    listeners.flushEvents();
+    createMessage((messageType, payload) -> selector.selectEdition(currentEdition)).send();
+    seekToDefaultPosition();
+    return true;
+  }
+
+  @Override
   public TrackSelectionParameters getTrackSelectionParameters() {
     verifyApplicationThread();
     TrackSelectionParameters parameters = trackSelector.getParameters();
@@ -1520,6 +1593,7 @@ import java.util.function.IntConsumer;
       this.surfaceHolderSurfaceIsVideoOutput = true;
       this.surfaceHolder = surfaceHolder;
       surfaceHolder.addCallback(componentListener);
+      updateVideoOutputSurfaceSize(videoSize);
       Surface surface = surfaceHolder.getSurface();
       if (surface != null && surface.isValid()) {
         setVideoOutputInternal(surface);
@@ -1693,6 +1767,38 @@ import java.util.function.IntConsumer;
   public float getVolume() {
     verifyApplicationThread();
     return volume;
+  }
+
+  @Override
+  public void setAudioOffsetMs(long audioOffsetMs) {
+    verifyApplicationThread();
+    if (this.audioOffsetMs == audioOffsetMs) {
+      return;
+    }
+    this.audioOffsetMs = audioOffsetMs;
+    internalPlayer.setAudioOffsetMs(audioOffsetMs);
+  }
+
+  @Override
+  public long getAudioOffsetMs() {
+    verifyApplicationThread();
+    return audioOffsetMs;
+  }
+
+  @Override
+  public void setTextOffsetMs(long textOffsetMs) {
+    verifyApplicationThread();
+    if (this.textOffsetMs == textOffsetMs) {
+      return;
+    }
+    this.textOffsetMs = textOffsetMs;
+    internalPlayer.setTextOffsetMs(textOffsetMs);
+  }
+
+  @Override
+  public long getTextOffsetMs() {
+    verifyApplicationThread();
+    return textOffsetMs;
   }
 
   @Override
@@ -1870,10 +1976,56 @@ import java.util.function.IntConsumer;
   }
 
   @Override
+  public @VideoEffectsSupport int getVideoEffectsSupport() {
+    verifyApplicationThread();
+    return getVideoEffectsSupport(renderers, playbackInfo.trackSelectorResult);
+  }
+
+  @Override
   @Nullable
   public Format getAudioFormat() {
     verifyApplicationThread();
     return audioFormat;
+  }
+
+  @Override
+  public @AudioProcessingSupport int getAudioProcessingSupport() {
+    verifyApplicationThread();
+    return getAudioProcessingSupportInternal();
+  }
+
+  @Override
+  public boolean isSkipSilenceSupported() {
+    verifyApplicationThread();
+    return getAudioProcessingSupportInternal() == AUDIO_PROCESSING_SUPPORTED
+        && initializedAudioTunnelingTrackCount == 0;
+  }
+
+  @Override
+  @Nullable
+  public String getVideoDecoderName() {
+    verifyApplicationThread();
+    return videoDecoderName;
+  }
+
+  @Override
+  @Nullable
+  public String getAudioDecoderName() {
+    verifyApplicationThread();
+    return audioDecoderName;
+  }
+
+  @Override
+  public boolean isAudioTrackInitialized() {
+    verifyApplicationThread();
+    return initializedAudioTrackCount > 0;
+  }
+
+  @Override
+  @Nullable
+  public Object getVideoOutput() {
+    verifyApplicationThread();
+    return videoOutput;
   }
 
   @Override
@@ -2089,6 +2241,78 @@ import java.util.function.IntConsumer;
       }
     }
     return false;
+  }
+
+  private static boolean isAudioPassthrough(AudioSink.AudioTrackConfig audioTrackConfig) {
+    return !audioTrackConfig.offload && !Util.isEncodingLinearPcm(audioTrackConfig.encoding);
+  }
+
+  private static boolean isAudioProcessingFormatUnsupported(
+      AudioSink.AudioTrackConfig audioTrackConfig) {
+    return !audioTrackConfig.offload
+        && Util.isEncodingLinearPcm(audioTrackConfig.encoding)
+        && audioTrackConfig.encoding != C.ENCODING_PCM_16BIT;
+  }
+
+  private @AudioProcessingSupport int getAudioProcessingSupportInternal() {
+    if (initializedAudioTrackCount == 0) {
+      return AUDIO_PROCESSING_UNAVAILABLE;
+    }
+    if (initializedAudioPassthroughTrackCount > 0) {
+      return AUDIO_PROCESSING_UNSUPPORTED_PASSTHROUGH;
+    }
+    if (initializedAudioOffloadTrackCount > 0) {
+      return AUDIO_PROCESSING_UNSUPPORTED_OFFLOAD;
+    }
+    return initializedAudioUnsupportedFormatTrackCount > 0
+        ? AUDIO_PROCESSING_UNSUPPORTED_FORMAT
+        : AUDIO_PROCESSING_SUPPORTED;
+  }
+
+  private void updateAudioTrackState(AudioSink.AudioTrackConfig audioTrackConfig, int delta) {
+    initializedAudioTrackCount = max(0, initializedAudioTrackCount + delta);
+    if (isAudioPassthrough(audioTrackConfig)) {
+      initializedAudioPassthroughTrackCount = max(0, initializedAudioPassthroughTrackCount + delta);
+    }
+    if (audioTrackConfig.offload) {
+      initializedAudioOffloadTrackCount = max(0, initializedAudioOffloadTrackCount + delta);
+    }
+    if (audioTrackConfig.tunneling) {
+      initializedAudioTunnelingTrackCount = max(0, initializedAudioTunnelingTrackCount + delta);
+    }
+    if (isAudioProcessingFormatUnsupported(audioTrackConfig)) {
+      initializedAudioUnsupportedFormatTrackCount =
+          max(0, initializedAudioUnsupportedFormatTrackCount + delta);
+    }
+  }
+
+  /* package */ static @VideoEffectsSupport int getVideoEffectsSupport(
+      Renderer[] renderers, TrackSelectorResult trackSelectorResult) {
+    for (int index = 0; index < trackSelectorResult.length; index++) {
+      @Nullable
+      RendererConfiguration configuration = trackSelectorResult.rendererConfigurations[index];
+      @Nullable ExoTrackSelection selection = trackSelectorResult.selections[index];
+      if (configuration == null || selection == null) {
+        continue;
+      }
+      Format format = selection.getSelectedFormat();
+      if (!MimeTypes.isVideo(format.sampleMimeType)) {
+        continue;
+      }
+      if (!(renderers[index] instanceof MediaCodecVideoRenderer)) {
+        return VIDEO_EFFECTS_UNSUPPORTED_RENDERER;
+      }
+      if (configuration.tunneling) {
+        return VIDEO_EFFECTS_UNSUPPORTED_TUNNELING;
+      }
+      if (format.drmInitData != null) {
+        return VIDEO_EFFECTS_UNSUPPORTED_DRM;
+      }
+      return MediaCodecVideoRenderer.isVideoEffectsFormatSupported(format)
+          ? VIDEO_EFFECTS_SUPPORTED
+          : VIDEO_EFFECTS_UNSUPPORTED_FORMAT;
+    }
+    return VIDEO_EFFECTS_UNAVAILABLE;
   }
 
   @Override
@@ -2320,6 +2544,8 @@ import java.util.function.IntConsumer;
             repeatCurrentMediaItem);
     boolean mediaItemTransitioned = mediaItemTransitionInfo.first;
     int mediaItemTransitionReason = mediaItemTransitionInfo.second;
+    boolean staticMetadataChanged =
+        !previousPlaybackInfo.staticMetadata.equals(newPlaybackInfo.staticMetadata);
     @Nullable MediaItem mediaItem = null;
     if (mediaItemTransitioned) {
       if (!newPlaybackInfo.timeline.isEmpty()) {
@@ -2330,8 +2556,7 @@ import java.util.function.IntConsumer;
       }
       staticAndDynamicMediaMetadata = MediaMetadata.EMPTY;
     }
-    if (mediaItemTransitioned
-        || !previousPlaybackInfo.staticMetadata.equals(newPlaybackInfo.staticMetadata)) {
+    if (mediaItemTransitioned || staticMetadataChanged) {
       staticAndDynamicMediaMetadata =
           staticAndDynamicMediaMetadata
               .buildUpon()
@@ -2446,6 +2671,9 @@ import java.util.function.IntConsumer;
           Player.EVENT_PLAYBACK_PARAMETERS_CHANGED,
           listener -> listener.onPlaybackParametersChanged(newPlaybackInfo.playbackParameters));
     }
+    if (timelineChanged || staticMetadataChanged || positionDiscontinuity) {
+      maybeUpdateMediaEntries(newPlaybackInfo);
+    }
     updateAvailableCommands();
     listeners.flushEvents();
 
@@ -2454,6 +2682,212 @@ import java.util.function.IntConsumer;
         listener.onSleepingForOffloadChanged(newPlaybackInfo.sleepingForOffload);
       }
     }
+  }
+
+  private void maybeUpdateMediaEntries(PlaybackInfo playbackInfo) {
+    if (playbackInfo.timeline.isEmpty()) {
+      updateMediaChapters(ImmutableList.of());
+      updateMediaEditions(ImmutableList.of());
+      return;
+    }
+    updateMediaChapters(readMediaChapters(playbackInfo));
+    updateMediaEditions(readMediaEditions(playbackInfo));
+  }
+
+  private ImmutableList<MediaChapter> readMediaChapters(PlaybackInfo playbackInfo) {
+    MediaChapterProvider provider = getCurrentSourceAs(playbackInfo, MediaChapterProvider.class);
+    if (provider != null) {
+      @Nullable List<MediaChapter> scanned = provider.getMediaChapters();
+      return scanned == null
+          ? ImmutableList.of()
+          : applyChapterSelection(scanned, getSelectedChapterIndex(scanned, playbackInfo));
+    }
+    ImmutableList<MediaChapter> metadataChapters = getMetadataChapters(playbackInfo);
+    return applyChapterSelection(
+        metadataChapters, getSelectedChapterIndex(metadataChapters, playbackInfo));
+  }
+
+  private ImmutableList<MediaEdition> readMediaEditions(PlaybackInfo playbackInfo) {
+    MediaEditionProvider provider = getCurrentSourceAs(playbackInfo, MediaEditionProvider.class);
+    if (provider == null) {
+      return ImmutableList.of();
+    }
+    @Nullable List<MediaEdition> editions = provider.getMediaEditions();
+    return editions == null
+        ? ImmutableList.of()
+        : applyEditionSelection(editions, provider.getSelectedMediaEditionIndex());
+  }
+
+  @Nullable
+  private <T> T getCurrentSourceAs(PlaybackInfo playbackInfo, Class<T> sourceType) {
+    MediaSource source = getCurrentSource(playbackInfo);
+    return sourceType.isInstance(source) ? sourceType.cast(source) : null;
+  }
+
+  @Nullable
+  private MediaSource getCurrentSource(PlaybackInfo playbackInfo) {
+    if (playbackInfo.timeline.isEmpty()) {
+      return null;
+    }
+    int windowIndex =
+        playbackInfo.timeline.getPeriodByUid(playbackInfo.periodId.periodUid, period).windowIndex;
+    if (windowIndex >= mediaSourceHolderSnapshots.size()) {
+      return null;
+    }
+    return unwrapMediaSource(mediaSourceHolderSnapshots.get(windowIndex).mediaSource);
+  }
+
+  private static MediaSource unwrapMediaSource(MediaSource source) {
+    while (source instanceof WrappingMediaSource) {
+      source = ((WrappingMediaSource) source).getWrappedSource();
+    }
+    return source;
+  }
+
+  private void updateMediaChapters(List<MediaChapter> chapters) {
+    ImmutableList<MediaChapter> newChapters = ImmutableList.copyOf(chapters);
+    if (newChapters.equals(currentMediaChapters)) {
+      return;
+    }
+    currentMediaChapters = newChapters;
+    listeners.queueEvent(
+        Player.EVENT_MEDIA_CHAPTERS_CHANGED, l -> l.onMediaChaptersChanged(newChapters));
+  }
+
+  private void updateMediaEditions(List<MediaEdition> editions) {
+    ImmutableList<MediaEdition> newEditions = ImmutableList.copyOf(editions);
+    if (newEditions.equals(currentMediaEditions)) {
+      return;
+    }
+    currentMediaEditions = newEditions;
+    listeners.queueEvent(
+        Player.EVENT_MEDIA_EDITIONS_CHANGED, l -> l.onMediaEditionsChanged(newEditions));
+  }
+
+  @Nullable
+  private static MediaChapter findMediaChapter(List<MediaChapter> chapters, int index) {
+    for (MediaChapter chapter : chapters) {
+      if (chapter.index == index) {
+        return chapter;
+      }
+    }
+    return null;
+  }
+
+  @Nullable
+  private static MediaEdition findMediaEdition(List<MediaEdition> editions, int index) {
+    for (MediaEdition edition : editions) {
+      if (edition.index == index) {
+        return edition;
+      }
+    }
+    return null;
+  }
+
+  private static ImmutableList<MediaChapter> applyChapterSelection(
+      List<MediaChapter> chapters, int selectedIndex) {
+    if (selectedIndex < 0) {
+      return ImmutableList.copyOf(chapters);
+    }
+    boolean changed = false;
+    ImmutableList.Builder<MediaChapter> result =
+        ImmutableList.builderWithExpectedSize(chapters.size());
+    for (MediaChapter chapter : chapters) {
+      boolean selected = chapter.index == selectedIndex;
+      if (chapter.selected == selected) {
+        result.add(chapter);
+      } else {
+        changed = true;
+        result.add(chapter.withSelected(selected));
+      }
+    }
+    return changed ? result.build() : ImmutableList.copyOf(chapters);
+  }
+
+  private static ImmutableList<MediaEdition> applyEditionSelection(
+      List<MediaEdition> editions, int selectedIndex) {
+    if (selectedIndex < 0) {
+      return ImmutableList.copyOf(editions);
+    }
+    boolean changed = false;
+    ImmutableList.Builder<MediaEdition> result =
+        ImmutableList.builderWithExpectedSize(editions.size());
+    for (MediaEdition edition : editions) {
+      boolean selected = edition.index == selectedIndex;
+      if (edition.selected == selected) {
+        result.add(edition);
+      } else {
+        changed = true;
+        result.add(edition.withSelected(selected));
+      }
+    }
+    return changed ? result.build() : ImmutableList.copyOf(editions);
+  }
+
+  private ImmutableList<MediaChapter> getMetadataChapters(PlaybackInfo playbackInfo) {
+    if (playbackInfo.staticMetadata.isEmpty()) {
+      return ImmutableList.of();
+    }
+    ArrayList<MediaChapter> chapters = new ArrayList<>();
+    for (int metadataIndex = 0;
+        metadataIndex < playbackInfo.staticMetadata.size();
+        metadataIndex++) {
+      Metadata metadata = playbackInfo.staticMetadata.get(metadataIndex);
+      for (int entryIndex = 0; entryIndex < metadata.length(); entryIndex++) {
+        Metadata.Entry entry = metadata.get(entryIndex);
+        if (!(entry instanceof Chapter)) {
+          continue;
+        }
+        Chapter chapter = (Chapter) entry;
+        if (chapter.isHidden() || chapter.getStartTimeMs() == C.TIME_UNSET) {
+          continue;
+        }
+        long timeUs =
+            max(
+                0,
+                periodPositionUsToWindowPositionUs(
+                    playbackInfo.timeline,
+                    playbackInfo.periodId,
+                    Util.msToUs(chapter.getStartTimeMs())));
+        if (!containsChapterAtTime(chapters, timeUs)) {
+          chapters.add(
+              MediaChapter.chapter(
+                  chapters.size(), timeUs, getChapterLabel(chapter, chapters.size()), false));
+        }
+      }
+    }
+    return ImmutableList.copyOf(chapters);
+  }
+
+  private static boolean containsChapterAtTime(List<MediaChapter> chapters, long timeUs) {
+    for (MediaChapter chapter : chapters) {
+      if (chapter.timeUs == timeUs) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private static String getChapterLabel(Chapter chapter, int index) {
+    @Nullable Label title = chapter.getTitle();
+    return title != null && !title.value.isEmpty() ? title.value : "Chapter " + (index + 1);
+  }
+
+  private int getSelectedChapterIndex(List<MediaChapter> chapters, PlaybackInfo playbackInfo) {
+    long positionUs =
+        periodPositionUsToWindowPositionUs(
+            playbackInfo.timeline, playbackInfo.periodId, playbackInfo.positionUs);
+    int selectedIndex = C.INDEX_UNSET;
+    long selectedTimeUs = Long.MIN_VALUE;
+    for (MediaChapter chapter : chapters) {
+      if (chapter.timeUs != C.TIME_UNSET
+          && chapter.timeUs <= positionUs
+          && chapter.timeUs >= selectedTimeUs) {
+        selectedIndex = chapter.index;
+        selectedTimeUs = chapter.timeUs;
+      }
+    }
+    return selectedIndex;
   }
 
   private PositionInfo getPreviousPositionInfo(
@@ -2975,7 +3409,14 @@ import java.util.function.IntConsumer;
     }
     MediaItem mediaItem = timeline.getWindow(getCurrentMediaItemIndex(), window).mediaItem;
     // MediaItem metadata is prioritized over metadata within the media.
-    return staticAndDynamicMediaMetadata.buildUpon().populate(mediaItem.mediaMetadata).build();
+    MediaMetadata.Builder mediaMetadataBuilder =
+        staticAndDynamicMediaMetadata.buildUpon().populate(mediaItem.mediaMetadata);
+    if (mediaItem.mediaMetadata.artworkData == null
+        && staticAndDynamicMediaMetadata.artworkData != null) {
+      mediaMetadataBuilder.setArtworkData(
+          staticAndDynamicMediaMetadata.artworkData, staticAndDynamicMediaMetadata.artworkDataType);
+    }
+    return mediaMetadataBuilder.build();
   }
 
   private void removeSurfaceCallbacks() {
@@ -2997,6 +3438,7 @@ import java.util.function.IntConsumer;
     }
     if (surfaceHolder != null) {
       surfaceHolder.removeCallback(componentListener);
+      resetVideoOutputSurfaceBufferSize();
       surfaceHolder = null;
     }
   }
@@ -3061,6 +3503,105 @@ import java.util.function.IntConsumer;
       sendRendererMessage(
           TRACK_TYPE_VIDEO, MSG_SET_VIDEO_OUTPUT_RESOLUTION, new Size(width, height));
     }
+  }
+
+  private void updateVideoOutputSurfaceSize(VideoSize videoSize) {
+    if (!surfaceHolderSurfaceIsVideoOutput || surfaceHolder == null) {
+      return;
+    }
+    Size surfaceBufferSize;
+    if (videoSize.equals(VideoSize.UNKNOWN) || videoSize.width <= 0 || videoSize.height <= 0) {
+      // Keep the current buffer fixed across transient renderer resets until the next valid size.
+      if (hasFixedSurfaceBufferSize()) {
+        return;
+      }
+      surfaceBufferSize = getCurrentSurfaceBufferSize();
+    } else {
+      surfaceBufferSize = getDisplaySizedSurfaceBufferSize(videoSize, getOrientedDisplaySize());
+      if (!surfaceBufferSize.equals(Size.UNKNOWN)) {
+        Size currentSurfaceBufferSize =
+            confirmedSurfaceBufferSize.equals(Size.UNKNOWN)
+                ? getCurrentSurfaceBufferSize()
+                : confirmedSurfaceBufferSize;
+        if (areSurfaceBufferSizesEquivalent(surfaceBufferSize, currentSurfaceBufferSize)) {
+          surfaceBufferSize = currentSurfaceBufferSize;
+        }
+      }
+    }
+    if (surfaceBufferSize.equals(Size.UNKNOWN)
+        || surfaceBufferSize.equals(pendingSurfaceBufferSize)
+        || (pendingSurfaceBufferSize.equals(Size.UNKNOWN)
+            && surfaceBufferSize.equals(confirmedSurfaceBufferSize))) {
+      return;
+    }
+    pendingSurfaceBufferSize = surfaceBufferSize;
+    surfaceHolder.setFixedSize(surfaceBufferSize.getWidth(), surfaceBufferSize.getHeight());
+  }
+
+  private Size getCurrentSurfaceBufferSize() {
+    Rect surfaceFrame = checkNotNull(surfaceHolder).getSurfaceFrame();
+    int width = surfaceFrame.width();
+    int height = surfaceFrame.height();
+    if (width <= 0 || height <= 0) {
+      return Size.UNKNOWN;
+    }
+    return new Size(width, height);
+  }
+
+  private Point getOrientedDisplaySize() {
+    Point displaySize = Util.getCurrentDisplayModeSize(applicationContext);
+    int orientation = applicationContext.getResources().getConfiguration().orientation;
+    boolean displayIsPortrait = displaySize.x < displaySize.y;
+    if ((orientation == Configuration.ORIENTATION_LANDSCAPE && displayIsPortrait)
+        || (orientation == Configuration.ORIENTATION_PORTRAIT && !displayIsPortrait)) {
+      return new Point(displaySize.y, displaySize.x);
+    }
+    return displaySize;
+  }
+
+  /* package */ static Size getDisplaySizedSurfaceBufferSize(
+      VideoSize videoSize, Point displaySize) {
+    if (videoSize.width <= 0
+        || videoSize.height <= 0
+        || videoSize.pixelWidthHeightRatio <= 0
+        || displaySize.x <= 0
+        || displaySize.y <= 0) {
+      return Size.UNKNOWN;
+    }
+    double videoAspectRatio =
+        (double) videoSize.width * videoSize.pixelWidthHeightRatio / videoSize.height;
+    double displayAspectRatio = (double) displaySize.x / displaySize.y;
+    if (videoAspectRatio >= displayAspectRatio) {
+      return new Size(
+          displaySize.x,
+          max(1, min(displaySize.y, (int) Math.round(displaySize.x / videoAspectRatio))));
+    }
+    return new Size(
+        max(1, min(displaySize.x, (int) Math.round(displaySize.y * videoAspectRatio))),
+        displaySize.y);
+  }
+
+  private static boolean areSurfaceBufferSizesEquivalent(Size first, Size second) {
+    if (first.equals(Size.UNKNOWN) || second.equals(Size.UNKNOWN)) {
+      return false;
+    }
+    float widthChange = Math.abs((float) first.getWidth() / second.getWidth() - 1);
+    float heightChange = Math.abs((float) first.getHeight() / second.getHeight() - 1);
+    return widthChange <= MAX_SURFACE_BUFFER_SIZE_CHANGE_FRACTION
+        && heightChange <= MAX_SURFACE_BUFFER_SIZE_CHANGE_FRACTION;
+  }
+
+  private boolean hasFixedSurfaceBufferSize() {
+    return !confirmedSurfaceBufferSize.equals(Size.UNKNOWN)
+        || !pendingSurfaceBufferSize.equals(Size.UNKNOWN);
+  }
+
+  private void resetVideoOutputSurfaceBufferSize() {
+    if (surfaceHolder != null && hasFixedSurfaceBufferSize()) {
+      surfaceHolder.setSizeFromLayout();
+    }
+    confirmedSurfaceBufferSize = Size.UNKNOWN;
+    pendingSurfaceBufferSize = Size.UNKNOWN;
   }
 
   private void maybeUpdatePlaybackSuppressionReason() {
@@ -3378,6 +3919,7 @@ import java.util.function.IntConsumer;
     @Override
     public void onVideoDecoderInitialized(
         String decoderName, long initializedTimestampMs, long initializationDurationMs) {
+      videoDecoderName = decoderName;
       analyticsCollector.onVideoDecoderInitialized(
           decoderName, initializedTimestampMs, initializationDurationMs);
     }
@@ -3397,6 +3939,7 @@ import java.util.function.IntConsumer;
     @Override
     public void onVideoSizeChanged(VideoSize newVideoSize) {
       videoSize = newVideoSize;
+      updateVideoOutputSurfaceSize(newVideoSize);
       listeners.sendEvent(
           EVENT_VIDEO_SIZE_CHANGED, listener -> listener.onVideoSizeChanged(newVideoSize));
     }
@@ -3411,6 +3954,9 @@ import java.util.function.IntConsumer;
 
     @Override
     public void onVideoDecoderReleased(String decoderName) {
+      if (decoderName.equals(videoDecoderName)) {
+        videoDecoderName = null;
+      }
       analyticsCollector.onVideoDecoderReleased(decoderName);
     }
 
@@ -3418,6 +3964,7 @@ import java.util.function.IntConsumer;
     public void onVideoDisabled(DecoderCounters counters) {
       analyticsCollector.onVideoDisabled(counters);
       videoFormat = null;
+      videoDecoderName = null;
       videoDecoderCounters = null;
     }
 
@@ -3442,6 +3989,7 @@ import java.util.function.IntConsumer;
     @Override
     public void onAudioDecoderInitialized(
         String decoderName, long initializedTimestampMs, long initializationDurationMs) {
+      audioDecoderName = decoderName;
       analyticsCollector.onAudioDecoderInitialized(
           decoderName, initializedTimestampMs, initializationDurationMs);
     }
@@ -3465,6 +4013,9 @@ import java.util.function.IntConsumer;
 
     @Override
     public void onAudioDecoderReleased(String decoderName) {
+      if (decoderName.equals(audioDecoderName)) {
+        audioDecoderName = null;
+      }
       analyticsCollector.onAudioDecoderReleased(decoderName);
     }
 
@@ -3472,6 +4023,7 @@ import java.util.function.IntConsumer;
     public void onAudioDisabled(DecoderCounters counters) {
       analyticsCollector.onAudioDisabled(counters);
       audioFormat = null;
+      audioDecoderName = null;
       audioDecoderCounters = null;
     }
 
@@ -3498,11 +4050,13 @@ import java.util.function.IntConsumer;
 
     @Override
     public void onAudioTrackInitialized(AudioSink.AudioTrackConfig audioTrackConfig) {
+      updateAudioTrackState(audioTrackConfig, 1);
       analyticsCollector.onAudioTrackInitialized(audioTrackConfig);
     }
 
     @Override
     public void onAudioTrackReleased(AudioSink.AudioTrackConfig audioTrackConfig) {
+      updateAudioTrackState(audioTrackConfig, -1);
       analyticsCollector.onAudioTrackReleased(audioTrackConfig);
     }
 
@@ -3564,6 +4118,13 @@ import java.util.function.IntConsumer;
 
     @Override
     public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
+      if (surfaceHolderSurfaceIsVideoOutput
+          && holder == surfaceHolder
+          && hasFixedSurfaceBufferSize()) {
+        confirmedSurfaceBufferSize =
+            width > 0 && height > 0 ? new Size(width, height) : Size.UNKNOWN;
+        pendingSurfaceBufferSize = Size.UNKNOWN;
+      }
       maybeNotifySurfaceSizeChanged(width, height);
     }
 

@@ -64,19 +64,33 @@ public final class DtsUtil {
     /** The bitrate of compressed stream. */
     public final int bitrate;
 
+    /** The codec marker of the DTS bitstream, or null if unknown. */
+    @Nullable public final String codecs;
+
     private DtsHeader(
         @Nullable String mimeType,
         int channelCount,
         int sampleRate,
         int frameSize,
         long frameDurationUs,
-        int bitrate) {
+        int bitrate,
+        @Nullable String codecs) {
       this.mimeType = mimeType;
       this.channelCount = channelCount;
       this.sampleRate = sampleRate;
       this.frameSize = frameSize;
       this.frameDurationUs = frameDurationUs;
       this.bitrate = bitrate;
+      this.codecs = codecs;
+    }
+
+    /** Returns a copy with {@link #codecs} replaced. */
+    public DtsHeader withCodecs(@Nullable String codecs) {
+      if (Objects.equals(this.codecs, codecs)) {
+        return this;
+      }
+      return new DtsHeader(
+          mimeType, channelCount, sampleRate, frameSize, frameDurationUs, bitrate, codecs);
     }
   }
 
@@ -89,6 +103,8 @@ public final class DtsUtil {
    *   <li>{@link MimeTypes#AUDIO_DTS}
    *   <li>{@link MimeTypes#AUDIO_DTS_EXPRESS}
    *   <li>{@link MimeTypes#AUDIO_DTS_HD}
+   *   <li>{@link MimeTypes#AUDIO_DTS_HD_MA}
+   *   <li>{@link MimeTypes#AUDIO_MEDIA3_DTS_HD_MA_CORELESS}
    *   <li>{@link MimeTypes#AUDIO_DTS_UHD_P2}
    * </ul>
    */
@@ -99,6 +115,8 @@ public final class DtsUtil {
     MimeTypes.AUDIO_DTS,
     MimeTypes.AUDIO_DTS_EXPRESS,
     MimeTypes.AUDIO_DTS_HD,
+    MimeTypes.AUDIO_DTS_HD_MA,
+    MimeTypes.AUDIO_MEDIA3_DTS_HD_MA_CORELESS,
     MimeTypes.AUDIO_DTS_UHD_P2
   })
   public @interface DtsAudioMimeType {}
@@ -156,6 +174,9 @@ public final class DtsUtil {
   /** Maximum bit-rate for a DTS Express audio stream, in bits per second. */
   public static final int DTS_EXPRESS_MAX_RATE_BITS_PER_SECOND = 768000;
 
+  /** Maximum DTS-HD MA XLL payload bytes to scan for DTS:X markers. */
+  public static final int XLL_X_SCAN_MAX_BYTES = 256 * 1024;
+
   /**
    * DTS Core Syncword (in different Endianness). See ETSI TS 102 114 V1.6.1 (2019-08), Section 5.3.
    */
@@ -182,6 +203,8 @@ public final class DtsUtil {
   private static final int SYNC_VALUE_UHD_FTOC_SYNC_LE = 0xF21B4140;
   private static final int SYNC_VALUE_UHD_FTOC_NONSYNC_BE = 0x71C442E8;
   private static final int SYNC_VALUE_UHD_FTOC_NONSYNC_LE = 0xE842C471;
+  private static final int DCA_SYNCWORD_XLL_X = 0x02000850;
+  private static final int DCA_SYNCWORD_XLL_X_IMAX_SHIFTED = 0xF14000D0 >>> 1;
 
   private static final byte FIRST_BYTE_BE = (byte) (SYNC_VALUE_BE >>> 24);
   private static final byte FIRST_BYTE_14B_BE = (byte) (SYNC_VALUE_14B_BE >>> 24);
@@ -251,6 +274,38 @@ public final class DtsUtil {
   public static boolean isDtsBaseAudioMimeType(@Nullable String mimeType) {
     return Objects.equals(mimeType, MimeTypes.AUDIO_DTS)
         || Objects.equals(mimeType, MimeTypes.AUDIO_DTS_HD);
+  }
+
+  /** Returns whether {@code mimeType} identifies a DTS-HD MA bitstream. */
+  public static boolean isDtsHdMaAudioMimeType(@Nullable String mimeType) {
+    return Objects.equals(mimeType, MimeTypes.AUDIO_DTS_HD_MA)
+        || Objects.equals(mimeType, MimeTypes.AUDIO_MEDIA3_DTS_HD_MA_CORELESS);
+  }
+
+  /** Returns the DTS:X codec marker found in {@code data}, or null if none is found. */
+  @Nullable
+  public static String getDtsXCodecs(byte[] data, int offset, int length) {
+    int word = 0;
+    int end = Math.min(data.length, offset + length);
+    for (int i = offset; i < end; i++) {
+      word = (word << 8) | (data[i] & 0xFF);
+      @Nullable String codecs = getDtsXCodecs(word);
+      if (codecs != null) {
+        return codecs;
+      }
+    }
+    return null;
+  }
+
+  /** Returns the DTS:X codec marker for a rolling 32-bit sync word, or null if it is not DTS:X. */
+  @Nullable
+  public static String getDtsXCodecs(int word) {
+    if (word == DCA_SYNCWORD_XLL_X) {
+      return MimeTypes.CODEC_DTS_HD_MA_X;
+    }
+    return (word >>> 1) == DCA_SYNCWORD_XLL_X_IMAX_SHIFTED
+        ? MimeTypes.CODEC_DTS_HD_MA_X_IMAX
+        : null;
   }
 
   /**
@@ -408,8 +463,14 @@ public final class DtsUtil {
         fsize = (((data[5] & 0x03) << 12) | ((data[6] & 0xFF) << 4) | ((data[7] & 0xF0) >> 4)) + 1;
     }
 
-    // If the frame is stored in 14-bit mode, adjust the frame size to reflect the actual byte size.
-    return uses14BitPerWord ? fsize * 16 / 14 : fsize;
+    if (!uses14BitPerWord) {
+      return fsize;
+    }
+    // A 14-bit stream stores each 14-bit word in a 16-bit container. Convert the unpacked byte size
+    // to a whole number of 14-bit words before converting those words to physical bytes. For
+    // example, DTS-CD frames with FSIZE+1 equal to 3585 have their next sync word after 2048 stored
+    // words, or 4096 bytes.
+    return (fsize * C.BITS_PER_BYTE / 14) * 2;
   }
 
   /**
@@ -585,7 +646,8 @@ public final class DtsUtil {
         sampleRate,
         extensionSubstreamFrameSize,
         frameDurationUs,
-        /* bitrate= */ 0);
+        /* bitrate= */ 0,
+        /* codecs= */ null);
   }
 
   // Asset descriptor: Dynamic Metadata - DRC, DNC and Mixing Metadata, see ETSI TS 102 114
@@ -656,11 +718,17 @@ public final class DtsUtil {
         int extensionMask = headerBits.readBits(12);
         if ((extensionMask & 0x100) != 0) { // Low bit rate component
           return MimeTypes.AUDIO_DTS_EXPRESS;
+        } else if ((extensionMask & 0x200) != 0) { // Lossless extension
+          if ((extensionMask & 0x001) != 0) { // Core component within the core substream
+            return MimeTypes.AUDIO_DTS_HD_MA;
+          } else {
+            return MimeTypes.AUDIO_MEDIA3_DTS_HD_MA_CORELESS;
+          }
         } else {
           return MimeTypes.AUDIO_DTS_HD;
         }
       case 1: // DTS-HD Loss-less coding mode without CBR component
-        return MimeTypes.AUDIO_DTS_HD;
+        return MimeTypes.AUDIO_MEDIA3_DTS_HD_MA_CORELESS;
       case 2: // DTS-HD Low bit-rate mode
         return MimeTypes.AUDIO_DTS_EXPRESS;
       case 3: // The auxiliary coding mode is reserved for future applications.
@@ -867,7 +935,8 @@ public final class DtsUtil {
         sampleRate,
         frameSize,
         frameDurationUs,
-        /* bitrate= */ 0);
+        /* bitrate= */ 0,
+        /* codecs= */ null);
   }
 
   /**
@@ -939,10 +1008,24 @@ public final class DtsUtil {
     // If the MIME type was parsed successfully, use it. If it is null (e.g. because static
     // fields were missing), there's nothing we can do other than assume it is DTS-HD.
     String mimeType = dtsHeader.mimeType != null ? dtsHeader.mimeType : MimeTypes.AUDIO_DTS_HD;
-    if (Objects.equals(format.sampleMimeType, mimeType)) {
+    @Nullable String codecs = dtsHeader.codecs;
+    if (codecs == null && isDtsHdMaAudioMimeType(mimeType)) {
+      int payloadOffset = sampleData.getPosition();
+      int payloadLength =
+          Math.min(
+              sampleData.bytesLeft(),
+              Math.min(Math.max(0, dtsHeader.frameSize - frameSize), XLL_X_SCAN_MAX_BYTES));
+      codecs = getDtsXCodecs(sampleData.getData(), payloadOffset, payloadLength);
+    }
+    if (Objects.equals(format.sampleMimeType, mimeType)
+        && (codecs == null || Objects.equals(format.codecs, codecs))) {
       return format;
     }
-    return format.buildUpon().setSampleMimeType(mimeType).build();
+    Format.Builder builder = format.buildUpon().setSampleMimeType(mimeType);
+    if (codecs != null) {
+      builder.setCodecs(codecs);
+    }
+    return builder.build();
   }
 
   /**
@@ -1020,6 +1103,47 @@ public final class DtsUtil {
         || frameHeader[0] == FIRST_BYTE_EXTSS_LE
         || frameHeader[0] == FIRST_BYTE_UHD_FTOC_SYNC_LE
         || frameHeader[0] == FIRST_BYTE_UHD_FTOC_NONSYNC_LE;
+  }
+
+  public static int readSyncWord(byte[] data) {
+    return ((data[0] & 0xFF) << 24)
+        | ((data[1] & 0xFF) << 16)
+        | ((data[2] & 0xFF) << 8)
+        | (data[3] & 0xFF);
+  }
+
+  public static int parseDtsHdFrameSize(byte[] header) {
+    ParsableBitArray bits = getNormalizedFrame(header);
+    bits.skipBits(32 + 8 + 2);
+    boolean longHeader = bits.readBit();
+    bits.skipBits(longHeader ? 12 : 8);
+    return bits.readBits(longHeader ? 20 : 16) + 1;
+  }
+
+  public static boolean isRiffContainer(ExtractorInput input) throws IOException {
+    byte[] header = new byte[4];
+    input.peekFully(header, 0, 4);
+    input.resetPeekPosition();
+    return header[0] == 0x52 && header[1] == 0x49 && header[2] == 0x46 && header[3] == 0x46;
+  }
+
+  public static int findDtsCoreSync(ExtractorInput input, int maxBytesToSearch) throws IOException {
+    byte[] scratch = new byte[4];
+    input.peekFully(scratch, 0, 2);
+    int bytesSniffed = 2;
+    maxBytesToSearch -= 2;
+    while (maxBytesToSearch >= 2) {
+      input.peekFully(scratch, 2, 2);
+      bytesSniffed += 2;
+      maxBytesToSearch -= 2;
+      int word = readSyncWord(scratch);
+      if (getFrameType(word) == FRAME_TYPE_CORE) {
+        return bytesSniffed - 4;
+      }
+      scratch[0] = scratch[2];
+      scratch[1] = scratch[3];
+    }
+    return -1;
   }
 
   private DtsUtil() {}

@@ -40,10 +40,8 @@ public final class DefaultTsPayloadReaderFactory implements TsPayloadReader.Fact
 
   /**
    * Flags controlling elementary stream readers' behavior. Possible flag values are {@link
-   * #FLAG_ALLOW_NON_IDR_KEYFRAMES}, {@link #FLAG_IGNORE_AAC_STREAM}, {@link
-   * #FLAG_IGNORE_H264_STREAM}, {@link #FLAG_DETECT_ACCESS_UNITS}, {@link
-   * #FLAG_IGNORE_SPLICE_INFO_STREAM}, {@link #FLAG_OVERRIDE_CAPTION_DESCRIPTORS} and {@link
-   * #FLAG_ENABLE_HDMV_DTS_AUDIO_STREAMS}.
+   * #FLAG_IGNORE_AAC_STREAM}, {@link #FLAG_IGNORE_H264_STREAM}, {@link
+   * #FLAG_IGNORE_SPLICE_INFO_STREAM} and {@link #FLAG_OVERRIDE_CAPTION_DESCRIPTORS}.
    */
   @Documented
   @Retention(RetentionPolicy.SOURCE)
@@ -51,21 +49,12 @@ public final class DefaultTsPayloadReaderFactory implements TsPayloadReader.Fact
   @IntDef(
       flag = true,
       value = {
-        FLAG_ALLOW_NON_IDR_KEYFRAMES,
         FLAG_IGNORE_AAC_STREAM,
         FLAG_IGNORE_H264_STREAM,
-        FLAG_DETECT_ACCESS_UNITS,
         FLAG_IGNORE_SPLICE_INFO_STREAM,
-        FLAG_OVERRIDE_CAPTION_DESCRIPTORS,
-        FLAG_ENABLE_HDMV_DTS_AUDIO_STREAMS
+        FLAG_OVERRIDE_CAPTION_DESCRIPTORS
       })
   public @interface Flags {}
-
-  /**
-   * When extracting H.264 samples, whether to treat samples consisting of non-IDR I slices as
-   * synchronization samples (key-frames).
-   */
-  public static final int FLAG_ALLOW_NON_IDR_KEYFRAMES = 1;
 
   /**
    * Prevents the creation of {@link AdtsReader} and {@link LatmReader} instances. This flag should
@@ -82,13 +71,6 @@ public final class DefaultTsPayloadReaderFactory implements TsPayloadReader.Fact
   public static final int FLAG_IGNORE_H264_STREAM = 1 << 2;
 
   /**
-   * When extracting H.264 samples, whether to split the input stream into access units (samples)
-   * based on slice headers. This flag should be disabled if the stream contains access unit
-   * delimiters (AUDs).
-   */
-  public static final int FLAG_DETECT_ACCESS_UNITS = 1 << 3;
-
-  /**
    * Prevents the creation of {@link SectionPayloadReader}s for splice information sections
    * (SCTE-35).
    */
@@ -102,14 +84,7 @@ public final class DefaultTsPayloadReaderFactory implements TsPayloadReader.Fact
    */
   public static final int FLAG_OVERRIDE_CAPTION_DESCRIPTORS = 1 << 5;
 
-  /**
-   * Sets whether HDMV DTS audio streams will be handled. If this flag is set, SCTE subtitles will
-   * not be detected, as they share the same elementary stream type as HDMV DTS.
-   */
-  public static final int FLAG_ENABLE_HDMV_DTS_AUDIO_STREAMS = 1 << 6;
-
   private static final int DESCRIPTOR_TAG_CAPTION_SERVICE = 0x86;
-
   private final @Flags int flags;
   private final List<Format> closedCaptionFormats;
 
@@ -166,18 +141,22 @@ public final class DefaultTsPayloadReaderFactory implements TsPayloadReader.Fact
                 new LatmReader(esInfo.language, esInfo.getRoleFlags(), MimeTypes.VIDEO_MP2T));
       case TsExtractor.TS_STREAM_TYPE_AC3:
       case TsExtractor.TS_STREAM_TYPE_E_AC3:
+      case TsExtractor.TS_STREAM_TYPE_HDMV_E_AC3:
+      case TsExtractor.TS_STREAM_TYPE_HDMV_E_AC3_SEC:
         return new PesReader(
             new Ac3Reader(esInfo.language, esInfo.getRoleFlags(), MimeTypes.VIDEO_MP2T));
       case TsExtractor.TS_STREAM_TYPE_AC4:
         return new PesReader(
             new Ac4Reader(esInfo.language, esInfo.getRoleFlags(), MimeTypes.VIDEO_MP2T));
       case TsExtractor.TS_STREAM_TYPE_HDMV_DTS:
-        if (!isSet(FLAG_ENABLE_HDMV_DTS_AUDIO_STREAMS)) {
-          return null;
-        }
-      // Fall through.
+        return new PesReader(
+            new DtsProbeReader(esInfo.language, esInfo.getRoleFlags(), MimeTypes.VIDEO_MP2T));
+      case TsExtractor.TS_STREAM_TYPE_HDMV_DTS_AUTO:
       case TsExtractor.TS_STREAM_TYPE_DTS:
       case TsExtractor.TS_STREAM_TYPE_DTS_HD:
+      case TsExtractor.TS_STREAM_TYPE_HDMV_DTS_HD_HRA:
+      case TsExtractor.TS_STREAM_TYPE_HDMV_DTS_HD_MASTER:
+      case TsExtractor.TS_STREAM_TYPE_HDMV_DTS_EXPRESS_SEC:
         return new PesReader(
             new DtsReader(
                 esInfo.language,
@@ -191,6 +170,12 @@ public final class DefaultTsPayloadReaderFactory implements TsPayloadReader.Fact
                 esInfo.getRoleFlags(),
                 DtsReader.FTOC_MAX_HEADER_SIZE,
                 MimeTypes.VIDEO_MP2T));
+      case TsExtractor.TS_STREAM_TYPE_HDMV_LPCM:
+        return new PesReader(new LpcmReader(esInfo.language, MimeTypes.VIDEO_MP2T));
+      case TsExtractor.TS_STREAM_TYPE_HDMV_TRUE_HD:
+        return new PesReader(new TrueHdReader(esInfo.language, MimeTypes.VIDEO_MP2T));
+      case TsExtractor.TS_STREAM_TYPE_HDMV_VC1:
+        return new PesReader(new Vc1Reader(MimeTypes.VIDEO_MP2T));
       case TsExtractor.TS_STREAM_TYPE_H262:
       case TsExtractor.TS_STREAM_TYPE_DC2_H262:
         return new PesReader(new H262Reader(buildUserDataReader(esInfo), MimeTypes.VIDEO_MP2T));
@@ -199,14 +184,23 @@ public final class DefaultTsPayloadReaderFactory implements TsPayloadReader.Fact
       case TsExtractor.TS_STREAM_TYPE_H264:
         return isSet(FLAG_IGNORE_H264_STREAM)
             ? null
-            : new PesReader(
-                new H264Reader(
-                    buildSeiReader(esInfo),
-                    isSet(FLAG_ALLOW_NON_IDR_KEYFRAMES),
-                    isSet(FLAG_DETECT_ACCESS_UNITS),
-                    MimeTypes.VIDEO_MP2T));
+            : new PesReader(new H264Reader(buildSeiReader(esInfo), MimeTypes.VIDEO_MP2T));
       case TsExtractor.TS_STREAM_TYPE_H265:
-        return new PesReader(new H265Reader(buildSeiReader(esInfo), MimeTypes.VIDEO_MP2T));
+        @Nullable
+        DolbyVisionDescriptor dolbyVisionDescriptor =
+            esInfo.dolbyVisionConfig != null
+                ? DolbyVisionDescriptor.parseFromDescriptorBytes(esInfo.descriptorBytes)
+                : null;
+        @Nullable
+        byte[] dolbyVisionCsd =
+            DolbyVisionDescriptor.buildInitializationData(
+                esInfo.dolbyVisionConfig, dolbyVisionDescriptor);
+        return new PesReader(
+            new H265Reader(
+                buildSeiReader(esInfo),
+                MimeTypes.VIDEO_MP2T,
+                esInfo.dolbyVisionConfig,
+                dolbyVisionCsd));
       case TsExtractor.TS_STREAM_TYPE_SPLICE_INFO:
         return isSet(FLAG_IGNORE_SPLICE_INFO_STREAM)
             ? null
@@ -225,6 +219,11 @@ public final class DefaultTsPayloadReaderFactory implements TsPayloadReader.Fact
                 /* containerMimeType= */ MimeTypes.VIDEO_MP2T));
       case TsExtractor.TS_STREAM_TYPE_MHAS:
         return new PesReader(new MpeghReader(MimeTypes.VIDEO_MP2T));
+      case TsExtractor.TS_STREAM_TYPE_PGS:
+        return new PesReader(new PgsReader(esInfo.language, MimeTypes.VIDEO_MP2T));
+      case TsExtractor.TS_STREAM_TYPE_AV3A:
+        return new PesReader(
+            new Av3aReader(esInfo.language, esInfo.getRoleFlags(), MimeTypes.VIDEO_MP2T));
       default:
         return null;
     }

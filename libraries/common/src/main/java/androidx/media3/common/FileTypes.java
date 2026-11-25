@@ -28,6 +28,7 @@ import java.lang.annotation.Retention;
 import java.lang.annotation.RetentionPolicy;
 import java.lang.annotation.Target;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 
 /** Defines common file type constants and helper methods. */
@@ -44,12 +45,14 @@ public final class FileTypes {
    *   <li>{@link #ADTS}
    *   <li>{@link #AMR}
    *   <li>{@link #FLAC}
+   *   <li>{@link #FLV}
    *   <li>{@link #MATROSKA}
    *   <li>{@link #MP3}
    *   <li>{@link #MP4}
    *   <li>{@link #OGG}
    *   <li>{@link #PS}
    *   <li>{@link #TS}
+   *   <li>{@link #WAV}
    *   <li>{@link #WEBVTT}
    *   <li>{@link #JPEG}
    *   <li>{@link #MIDI}
@@ -59,6 +62,14 @@ public final class FileTypes {
    *   <li>{@link #BMP}
    *   <li>{@link #HEIF}
    *   <li>{@link #AVIF}
+   *   <li>{@link #ASF}
+   *   <li>{@link #RM}
+   *   <li>{@link #ISO}
+   *   <li>{@link #M2TS}
+   *   <li>{@link #DSF}
+   *   <li>{@link #DFF}
+   *   <li>{@link #DTS}
+   *   <li>{@link #MMT_TLV}
    * </ul>
    */
   @Documented
@@ -66,7 +77,7 @@ public final class FileTypes {
   @Target(TYPE_USE)
   @IntDef({
     UNKNOWN, AC3, AC4, ADTS, AMR, FLAC, FLV, MATROSKA, MP3, MP4, OGG, PS, TS, WAV, WEBVTT, JPEG,
-    MIDI, AVI, PNG, WEBP, BMP, HEIF, AVIF
+    MIDI, AVI, PNG, WEBP, BMP, HEIF, AVIF, ASF, RM, ISO, M2TS, DSF, DFF, DTS, MMT_TLV
   })
   public @interface Type {}
 
@@ -139,6 +150,30 @@ public final class FileTypes {
   /** File type for the AVIF format. */
   public static final int AVIF = 21;
 
+  /** File type for the RealMedia format, including RM and RMVB. */
+  public static final int RM = 22;
+
+  /** File type for the ASF format, including WMA and WMV. */
+  public static final int ASF = 23;
+
+  /** File type for ISO disc image formats (DVD and Blu-ray). */
+  public static final int ISO = 24;
+
+  /** File type for the M2TS (Blu-ray MPEG-2 Transport Stream) format. */
+  public static final int M2TS = 25;
+
+  /** File type for the DSF (DSD Stream File) format. */
+  public static final int DSF = 26;
+
+  /** File type for the DFF (DSDIFF) format. */
+  public static final int DFF = 27;
+
+  /** File type for the raw DTS audio format. */
+  public static final int DTS = 28;
+
+  /** File type for MMT (MPEG Media Transport) carried in TLV packets. */
+  public static final int MMT_TLV = 29;
+
   @VisibleForTesting /* package */ static final String HEADER_CONTENT_TYPE = "Content-Type";
 
   private static final String EXTENSION_AC3 = ".ac3";
@@ -169,11 +204,14 @@ public final class FileTypes {
   private static final String EXTENSION_PREFIX_TS = ".ts";
   private static final String EXTENSION_WAV = ".wav";
   private static final String EXTENSION_WAVE = ".wave";
+  private static final String EXTENSION_WMA = ".wma";
+  private static final String EXTENSION_WMV = ".wmv";
   private static final String EXTENSION_VTT = ".vtt";
   private static final String EXTENSION_WEBVTT = ".webvtt";
   private static final String EXTENSION_JPG = ".jpg";
   private static final String EXTENSION_JPEG = ".jpeg";
   private static final String EXTENSION_AVI = ".avi";
+  private static final String EXTENSION_ASF = ".asf";
   private static final String EXTENSION_PNG = ".png";
   private static final String EXTENSION_WEBP = ".webp";
   private static final String EXTENSION_BMP = ".bmp";
@@ -181,6 +219,18 @@ public final class FileTypes {
   private static final String EXTENSION_HEIC = ".heic";
   private static final String EXTENSION_HEIF = ".heif";
   private static final String EXTENSION_AVIF = ".avif";
+  private static final String EXTENSION_RM = ".rm";
+  private static final String EXTENSION_RMVB = ".rmvb";
+  private static final String EXTENSION_ISO = ".iso";
+  private static final String EXTENSION_M2TS = ".m2ts";
+  private static final String EXTENSION_MTS = ".mts";
+  private static final String EXTENSION_M2T = ".m2t";
+  private static final String EXTENSION_DSF = ".dsf";
+  private static final String EXTENSION_DFF = ".dff";
+  private static final String EXTENSION_DTS = ".dts";
+  private static final String EXTENSION_MMT = ".mmt";
+  private static final String EXTENSION_MMTS = ".mmts";
+  private static final String EXTENSION_TLV = ".tlv";
 
   private FileTypes() {}
 
@@ -246,6 +296,9 @@ public final class FileTypes {
         return FileTypes.JPEG;
       case MimeTypes.VIDEO_AVI:
         return FileTypes.AVI;
+      case MimeTypes.AUDIO_WMA:
+      case MimeTypes.VIDEO_WMV:
+        return FileTypes.ASF;
       case MimeTypes.IMAGE_PNG:
         return FileTypes.PNG;
       case MimeTypes.IMAGE_WEBP:
@@ -257,6 +310,25 @@ public final class FileTypes {
         return FileTypes.HEIF;
       case MimeTypes.IMAGE_AVIF:
         return FileTypes.AVIF;
+      case MimeTypes.APPLICATION_RM:
+        return FileTypes.RM;
+      case MimeTypes.VIDEO_ISO:
+        return FileTypes.ISO;
+      case MimeTypes.AUDIO_DSD_LSBF_PLANAR:
+      case MimeTypes.AUDIO_DSD_MSBF_PLANAR:
+        return FileTypes.DSF;
+      case MimeTypes.AUDIO_DSD:
+      case MimeTypes.AUDIO_DST:
+        return FileTypes.DFF;
+      case MimeTypes.AUDIO_DTS:
+      case MimeTypes.AUDIO_DTS_HD:
+      case MimeTypes.AUDIO_DTS_HD_MA:
+      case MimeTypes.AUDIO_MEDIA3_DTS_HD_MA_CORELESS:
+      case MimeTypes.AUDIO_DTS_EXPRESS:
+      case MimeTypes.AUDIO_DTS_UHD_P2:
+        return FileTypes.DTS;
+      case MimeTypes.VIDEO_MMT_TLV:
+        return FileTypes.MMT_TLV;
       default:
         return FileTypes.UNKNOWN;
     }
@@ -265,6 +337,9 @@ public final class FileTypes {
   /** Returns the {@link Type} corresponding to the {@link Uri} provided. */
   public static @FileTypes.Type int inferFileTypeFromUri(Uri uri) {
     @Nullable String filename = uri.getLastPathSegment();
+    if (filename != null) {
+      filename = filename.toLowerCase(Locale.US);
+    }
     if (filename == null) {
       return FileTypes.UNKNOWN;
     } else if (filename.endsWith(EXTENSION_AC3) || filename.endsWith(EXTENSION_EC3)) {
@@ -311,6 +386,10 @@ public final class FileTypes {
         || filename.endsWith(EXTENSION_MPG)
         || filename.endsWith(EXTENSION_M2P)) {
       return FileTypes.PS;
+    } else if (filename.endsWith(EXTENSION_M2TS)
+        || filename.endsWith(EXTENSION_MTS)
+        || filename.endsWith(EXTENSION_M2T)) {
+      return FileTypes.M2TS;
     } else if (filename.endsWith(EXTENSION_TS)
         || filename.startsWith(
             EXTENSION_PREFIX_TS,
@@ -334,6 +413,24 @@ public final class FileTypes {
       return FileTypes.HEIF;
     } else if (filename.endsWith(EXTENSION_AVIF)) {
       return FileTypes.AVIF;
+    } else if (filename.endsWith(EXTENSION_RM) || filename.endsWith(EXTENSION_RMVB)) {
+      return FileTypes.RM;
+    } else if (filename.endsWith(EXTENSION_ASF)
+        || filename.endsWith(EXTENSION_WMA)
+        || filename.endsWith(EXTENSION_WMV)) {
+      return FileTypes.ASF;
+    } else if (filename.endsWith(EXTENSION_ISO)) {
+      return FileTypes.ISO;
+    } else if (filename.endsWith(EXTENSION_DSF)) {
+      return FileTypes.DSF;
+    } else if (filename.endsWith(EXTENSION_DFF)) {
+      return FileTypes.DFF;
+    } else if (filename.endsWith(EXTENSION_DTS)) {
+      return FileTypes.DTS;
+    } else if (filename.endsWith(EXTENSION_MMT)
+        || filename.endsWith(EXTENSION_MMTS)
+        || filename.endsWith(EXTENSION_TLV)) {
+      return FileTypes.MMT_TLV;
     } else {
       return FileTypes.UNKNOWN;
     }

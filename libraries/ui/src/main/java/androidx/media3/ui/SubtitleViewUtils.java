@@ -18,6 +18,7 @@ package androidx.media3.ui;
 
 import static com.google.common.base.Preconditions.checkNotNull;
 
+import android.graphics.RectF;
 import android.text.Spannable;
 import android.text.SpannableString;
 import android.text.Spanned;
@@ -26,6 +27,7 @@ import android.text.style.RelativeSizeSpan;
 import androidx.media3.common.text.Cue;
 import androidx.media3.common.text.LanguageFeatureSpan;
 import com.google.common.base.Predicate;
+import java.util.List;
 
 /** Utility class for subtitle layout logic. */
 /* package */ final class SubtitleViewUtils {
@@ -55,6 +57,113 @@ import com.google.common.base.Predicate;
       default:
         return Cue.DIMEN_UNSET;
     }
+  }
+
+  /** Scales a bitmap cue around its visual center. */
+  public static Cue scaleBitmapCue(Cue cue, float scale) {
+    if (cue.bitmap == null) {
+      return cue;
+    }
+    boolean hasWidth = cue.size != Cue.DIMEN_UNSET;
+    boolean hasHeight = cue.bitmapHeight != Cue.DIMEN_UNSET;
+    if (!hasWidth && !hasHeight) {
+      return cue;
+    }
+    Cue.Builder builder = cue.buildUpon();
+    if (hasWidth) {
+      float scaledSize = cue.size * scale;
+      builder.setSize(scaledSize);
+      if (cue.position != Cue.DIMEN_UNSET) {
+        float offset = (cue.size - scaledSize) / 2.0f;
+        if (cue.positionAnchor == Cue.ANCHOR_TYPE_START) {
+          builder.setPosition(cue.position + offset);
+        } else if (cue.positionAnchor == Cue.ANCHOR_TYPE_END) {
+          builder.setPosition(cue.position - offset);
+        }
+      }
+    }
+    if (hasHeight) {
+      float scaledHeight = cue.bitmapHeight * scale;
+      builder.setBitmapHeight(scaledHeight);
+      if (cue.line != Cue.DIMEN_UNSET && cue.lineType == Cue.LINE_TYPE_FRACTION) {
+        float offset = (cue.bitmapHeight - scaledHeight) / 2.0f;
+        if (cue.lineAnchor == Cue.ANCHOR_TYPE_START) {
+          builder.setLine(cue.line + offset, cue.lineType);
+        } else if (cue.lineAnchor == Cue.ANCHOR_TYPE_END) {
+          builder.setLine(cue.line - offset, cue.lineType);
+        }
+      }
+    }
+    return builder.build();
+  }
+
+  /** Scales a region-based text cue around the visual center of compatible regions. */
+  public static Cue scaleRegionTextCue(Cue cue, List<Cue> cues, float scale) {
+    if (!isRegionTextCue(cue)) {
+      return cue;
+    }
+    RectF cueBounds = getTextRegionBounds(cue);
+    RectF groupBounds = new RectF(cueBounds);
+    for (int i = 0; i < cues.size(); i++) {
+      Cue candidate = cues.get(i);
+      if (isCompatibleRegionTextCue(cue, candidate)) {
+        groupBounds.union(getTextRegionBounds(candidate));
+      }
+    }
+    float scaledWidth = cueBounds.width() * scale;
+    float scaledHeight = cueBounds.height() * scale;
+    float centerX = groupBounds.centerX();
+    float centerY = groupBounds.centerY();
+    float scaledLeft = centerX + (cueBounds.left - centerX) * scale;
+    float scaledTop = centerY + (cueBounds.top - centerY) * scale;
+    return cue.buildUpon()
+        .setPosition(getAnchorPosition(scaledLeft, scaledWidth, cue.positionAnchor))
+        .setLine(getAnchorPosition(scaledTop, scaledHeight, cue.lineAnchor), cue.lineType)
+        .setSize(scaledWidth)
+        .setTextRegionHeight(scaledHeight)
+        .build();
+  }
+
+  private static boolean isCompatibleRegionTextCue(Cue cue, Cue candidate) {
+    return isRegionTextCue(candidate)
+        && cue.zIndex == candidate.zIndex
+        && cue.collisionAvoidance == candidate.collisionAvoidance;
+  }
+
+  private static boolean isRegionTextCue(Cue cue) {
+    return cue.text != null
+        && cue.verticalType == Cue.TYPE_UNSET
+        && cue.size > 0
+        && cue.textRegionHeight > 0
+        && cue.position != Cue.DIMEN_UNSET
+        && cue.line != Cue.DIMEN_UNSET
+        && cue.lineType == Cue.LINE_TYPE_FRACTION;
+  }
+
+  private static RectF getTextRegionBounds(Cue cue) {
+    float left = getAnchorStart(cue.position, cue.size, cue.positionAnchor);
+    float top = getAnchorStart(cue.line, cue.textRegionHeight, cue.lineAnchor);
+    return new RectF(left, top, left + cue.size, top + cue.textRegionHeight);
+  }
+
+  private static float getAnchorStart(float position, float size, @Cue.AnchorType int anchorType) {
+    if (anchorType == Cue.ANCHOR_TYPE_END) {
+      return position - size;
+    }
+    if (anchorType == Cue.ANCHOR_TYPE_MIDDLE) {
+      return position - size / 2.0f;
+    }
+    return position;
+  }
+
+  private static float getAnchorPosition(float start, float size, @Cue.AnchorType int anchorType) {
+    if (anchorType == Cue.ANCHOR_TYPE_END) {
+      return start + size;
+    }
+    if (anchorType == Cue.ANCHOR_TYPE_MIDDLE) {
+      return start + size / 2.0f;
+    }
+    return start;
   }
 
   /** Removes all styling information from {@code cue}. */
@@ -90,6 +199,31 @@ import com.google.common.base.Predicate;
       removeSpansIf(
           (Spannable) checkNotNull(cue.getText()),
           span -> span instanceof AbsoluteSizeSpan || span instanceof RelativeSizeSpan);
+    }
+  }
+
+  /** Scales all embedded absolute font sizes in {@code cue}. */
+  public static void scaleEmbeddedFontSizes(Cue.Builder cue, float scale) {
+    if (cue.getTextSize() != Cue.DIMEN_UNSET) {
+      cue.setTextSize(cue.getTextSize() * scale, cue.getTextSizeType());
+    }
+    CharSequence text = cue.getText();
+    if (!(text instanceof Spanned)) {
+      return;
+    }
+    Spannable spannable = new SpannableString(text);
+    cue.setText(spannable);
+    AbsoluteSizeSpan[] spans = spannable.getSpans(0, spannable.length(), AbsoluteSizeSpan.class);
+    for (AbsoluteSizeSpan span : spans) {
+      int start = spannable.getSpanStart(span);
+      int end = spannable.getSpanEnd(span);
+      int flags = spannable.getSpanFlags(span);
+      spannable.removeSpan(span);
+      spannable.setSpan(
+          new AbsoluteSizeSpan(Math.max(1, Math.round(span.getSize() * scale)), span.getDip()),
+          start,
+          end,
+          flags);
     }
   }
 

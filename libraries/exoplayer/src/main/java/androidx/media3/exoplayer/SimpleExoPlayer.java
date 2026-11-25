@@ -32,6 +32,8 @@ import androidx.media3.common.C;
 import androidx.media3.common.DeviceInfo;
 import androidx.media3.common.Effect;
 import androidx.media3.common.Format;
+import androidx.media3.common.MediaChapter;
+import androidx.media3.common.MediaEdition;
 import androidx.media3.common.MediaItem;
 import androidx.media3.common.MediaMetadata;
 import androidx.media3.common.PlaybackParameters;
@@ -68,7 +70,7 @@ import java.util.List;
 @UnstableApi
 @Deprecated
 @SuppressWarnings("deprecation") // The whole class is deprecated so using deprecated things is OK.
-public class SimpleExoPlayer extends BasePlayer implements ExoPlayer {
+public class SimpleExoPlayer extends BasePlayer implements ExoPlayer, ExoPlayerDebugInfo {
 
   /**
    * @deprecated Use {@link ExoPlayer.Builder} instead.
@@ -446,6 +448,18 @@ public class SimpleExoPlayer extends BasePlayer implements ExoPlayer {
   }
 
   @Override
+  public boolean selectChapter(MediaChapter chapter) {
+    blockUntilConstructorFinished();
+    return player.selectChapter(chapter);
+  }
+
+  @Override
+  public boolean selectEdition(MediaEdition edition) {
+    blockUntilConstructorFinished();
+    return player.selectEdition(edition);
+  }
+
+  @Override
   public void setVideoScalingMode(@C.VideoScalingMode int videoScalingMode) {
     blockUntilConstructorFinished();
     player.setVideoScalingMode(videoScalingMode);
@@ -609,6 +623,30 @@ public class SimpleExoPlayer extends BasePlayer implements ExoPlayer {
   }
 
   @Override
+  public void setAudioOffsetMs(long audioOffsetMs) {
+    blockUntilConstructorFinished();
+    player.setAudioOffsetMs(audioOffsetMs);
+  }
+
+  @Override
+  public long getAudioOffsetMs() {
+    blockUntilConstructorFinished();
+    return player.getAudioOffsetMs();
+  }
+
+  @Override
+  public void setTextOffsetMs(long textOffsetMs) {
+    blockUntilConstructorFinished();
+    player.setTextOffsetMs(textOffsetMs);
+  }
+
+  @Override
+  public long getTextOffsetMs() {
+    blockUntilConstructorFinished();
+    return player.getTextOffsetMs();
+  }
+
+  @Override
   public void mute() {
     blockUntilConstructorFinished();
     player.mute();
@@ -706,10 +744,55 @@ public class SimpleExoPlayer extends BasePlayer implements ExoPlayer {
   }
 
   @Override
+  public @VideoEffectsSupport int getVideoEffectsSupport() {
+    blockUntilConstructorFinished();
+    return player.getVideoEffectsSupport();
+  }
+
+  @Override
   @Nullable
   public Format getAudioFormat() {
     blockUntilConstructorFinished();
     return player.getAudioFormat();
+  }
+
+  @Override
+  public @AudioProcessingSupport int getAudioProcessingSupport() {
+    blockUntilConstructorFinished();
+    return player.getAudioProcessingSupport();
+  }
+
+  @Override
+  public boolean isSkipSilenceSupported() {
+    blockUntilConstructorFinished();
+    return player.isSkipSilenceSupported();
+  }
+
+  @Override
+  @Nullable
+  public String getVideoDecoderName() {
+    blockUntilConstructorFinished();
+    return player.getVideoDecoderName();
+  }
+
+  @Override
+  @Nullable
+  public String getAudioDecoderName() {
+    blockUntilConstructorFinished();
+    return player.getAudioDecoderName();
+  }
+
+  @Override
+  public boolean isAudioTrackInitialized() {
+    blockUntilConstructorFinished();
+    return player.isAudioTrackInitialized();
+  }
+
+  @Override
+  @Nullable
+  public Object getVideoOutput() {
+    blockUntilConstructorFinished();
+    return player.getVideoOutput();
   }
 
   @Override

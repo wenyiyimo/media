@@ -120,6 +120,8 @@ public final class CodecSpecificDataUtil {
   }
 
   private static final byte[] NAL_START_CODE = new byte[] {0, 0, 0, 1};
+  private static final int DOLBY_VISION_CSD_INDEX = 2;
+  private static final int DOLBY_VISION_MIN_CSD_LENGTH = 4;
   private static final String[] HEVC_GENERAL_PROFILE_SPACE_STRINGS =
       new String[] {"", "A", "B", "C"};
 
@@ -626,6 +628,31 @@ public final class CodecSpecificDataUtil {
   }
 
   /**
+   * Returns Dolby Vision initialization data with explicit base-layer compatibility signalling.
+   *
+   * @param profile The Dolby Vision codec profile. This is the integer profile, not the {@link
+   *     MediaCodecInfo.CodecProfileLevel} constant.
+   * @param level The Dolby Vision codec level. This is the integer level, not the {@link
+   *     MediaCodecInfo.CodecProfileLevel} constant.
+   * @param blSignalCompatibilityId The Dolby Vision base-layer signal compatibility id, or {@code
+   *     -1} to use the default for {@code profile}.
+   * @param mdCompression The Dolby Vision metadata compression value, or {@code -1} to use the
+   *     default for {@code profile}.
+   */
+  public static byte[] buildDolbyVisionInitializationData(
+      int profile, int level, int blSignalCompatibilityId, int mdCompression) {
+    byte[] dolbyVisionCsd = buildDolbyVisionInitializationData(profile, level);
+    int existingFlags = dolbyVisionCsd[4] & 0xFF;
+    int resolvedBlSignalCompatibilityId =
+        blSignalCompatibilityId >= 0 ? blSignalCompatibilityId : (existingFlags >> 4) & 0xF;
+    int resolvedMdCompression = mdCompression >= 0 ? mdCompression : (existingFlags >> 2) & 0x3;
+    dolbyVisionCsd[4] =
+        (byte)
+            (((resolvedBlSignalCompatibilityId & 0xF) << 4) | ((resolvedMdCompression & 0x3) << 2));
+    return dolbyVisionCsd;
+  }
+
+  /**
    * Returns initialization data for Opus according to <a
    * href="https://tools.ietf.org/html/rfc7845#section-5.1">RFC 7845: 5.1</a>.
    *
@@ -661,6 +688,148 @@ public final class CodecSpecificDataUtil {
       checkArgument(csd0SignatureString.equals("OpusHead"));
     }
     return Arrays.copyOfRange(csd0, payloadOffset, payloadOffset + payloadLength);
+  }
+
+  /**
+   * Returns a copy of {@code initializationData} with the Dolby Vision configuration record placed
+   * at index 2 (csd-2). Indices 0 and 1 are padded with empty byte arrays if not already present.
+   * An existing non-Dolby Vision entry at index 2 is shifted rather than discarded.
+   *
+   * @param initializationData The existing initialization data list, or {@code null}.
+   * @param dvCsd The Dolby Vision configuration record bytes.
+   * @return A new mutable list with the DV config at index 2.
+   */
+  public static List<byte[]> setDolbyVisionCsd(
+      @Nullable List<byte[]> initializationData, byte[] dvCsd) {
+    List<byte[]> result =
+        initializationData != null ? new ArrayList<>(initializationData) : new ArrayList<>();
+    while (result.size() < DOLBY_VISION_CSD_INDEX) {
+      result.add(new byte[0]);
+    }
+    if (result.size() == DOLBY_VISION_CSD_INDEX) {
+      result.add(dvCsd);
+    } else if (isDolbyVisionConfigurationRecord(result.get(DOLBY_VISION_CSD_INDEX))) {
+      result.set(DOLBY_VISION_CSD_INDEX, dvCsd);
+    } else {
+      result.add(DOLBY_VISION_CSD_INDEX, dvCsd);
+    }
+    return result;
+  }
+
+  /**
+   * Returns the Dolby Vision configuration record stored at csd-2, or {@code null} if unavailable.
+   */
+  @Nullable
+  public static byte[] getDolbyVisionCsd(Format format) {
+    if (!MimeTypes.VIDEO_DOLBY_VISION.equals(format.sampleMimeType)
+        || format.initializationData.size() <= DOLBY_VISION_CSD_INDEX) {
+      return null;
+    }
+    byte[] dolbyVisionCsd = format.initializationData.get(DOLBY_VISION_CSD_INDEX);
+    if (!isDolbyVisionConfigurationRecord(dolbyVisionCsd)) {
+      return null;
+    }
+    @Nullable Pair<Integer, Integer> profileAndLevel = getCodecProfileAndLevel(format);
+    int csdProfile = (dolbyVisionCsd[2] & 0xFE) >> 1;
+    return profileAndLevel == null
+            || dolbyVisionConstantToProfileNumber(profileAndLevel.first) == csdProfile
+        ? dolbyVisionCsd
+        : null;
+  }
+
+  /**
+   * Returns whether the Dolby Vision configuration record declares RPU metadata.
+   *
+   * <p>This returns {@code false} when the configuration record is unavailable or inconsistent with
+   * the format's Dolby Vision profile.
+   */
+  public static boolean hasDolbyVisionRpu(Format format) {
+    @Nullable byte[] dolbyVisionCsd = getDolbyVisionCsd(format);
+    return dolbyVisionCsd != null && (dolbyVisionCsd[3] & 0x04) != 0;
+  }
+
+  /**
+   * Returns the MIME type of a standard SDR, HDR10 or HLG Dolby Vision base layer that can be
+   * decoded without Dolby Vision processing, or {@code null} if no such base layer is proven.
+   *
+   * <p>Profiles 4 and 9 define compatible base layers, unless an available configuration record
+   * explicitly says that the base layer is absent. Profile 7 requires an explicitly present base
+   * layer. Profile 8 additionally requires compatibility signalling for HDR10, SDR or HLG. Profile
+   * 10 uses configuration-record compatibility signalling when the record is available. Without a
+   * record, it uses the standardized color-metadata distinction between its compatible
+   * limited-range variant and non-compatible full-range PQ variant.
+   */
+  @Nullable
+  public static String getDolbyVisionCompatibleBaseLayerMimeType(Format format) {
+    if (!MimeTypes.VIDEO_DOLBY_VISION.equals(format.sampleMimeType)) {
+      return null;
+    }
+    @Nullable Pair<Integer, Integer> profileAndLevel = getCodecProfileAndLevel(format);
+    if (profileAndLevel == null) {
+      return null;
+    }
+    @Nullable byte[] dolbyVisionCsd = getDolbyVisionCsd(format);
+    boolean hasBaseLayer = dolbyVisionCsd != null && (dolbyVisionCsd[3] & 0x01) != 0;
+    switch (profileAndLevel.first) {
+      case CodecProfileLevel.DolbyVisionProfileDvheDtr: // Profile 4.
+      case CodecProfileLevel.DolbyVisionProfileDvavSe: // Profile 9.
+        if (dolbyVisionCsd != null && !hasBaseLayer) {
+          return null;
+        }
+        break;
+      case CodecProfileLevel.DolbyVisionProfileDvheDtb: // Profile 7.
+        if (!hasBaseLayer) {
+          return null;
+        }
+        break;
+      case CodecProfileLevel.DolbyVisionProfileDvheSt: // Profile 8.
+        if (!hasBaseLayer || !hasStandardBaseLayerSignal(dolbyVisionCsd)) {
+          return null;
+        }
+        break;
+      case CodecProfileLevel.DolbyVisionProfileDvav110: // Profile 10.
+        if (dolbyVisionCsd != null
+            ? !hasBaseLayer || !hasStandardBaseLayerSignal(dolbyVisionCsd)
+            : !hasStandardBaseLayerColorInfo(format.colorInfo)) {
+          return null;
+        }
+        break;
+      default:
+        return null;
+    }
+    return getDolbyVisionBaseLayerMimeType(format);
+  }
+
+  private static boolean hasStandardBaseLayerSignal(byte[] dolbyVisionCsd) {
+    if (dolbyVisionCsd.length < 5) {
+      return false;
+    }
+    int compatibilityId = (dolbyVisionCsd[4] >> 4) & 0x0F;
+    return compatibilityId == 1 || compatibilityId == 2 || compatibilityId == 4;
+  }
+
+  private static boolean hasStandardBaseLayerColorInfo(@Nullable ColorInfo colorInfo) {
+    if (colorInfo == null || colorInfo.colorRange != C.COLOR_RANGE_LIMITED) {
+      return false;
+    }
+    return (colorInfo.colorSpace == C.COLOR_SPACE_BT2020
+            && (colorInfo.colorTransfer == C.COLOR_TRANSFER_ST2084
+                || colorInfo.colorTransfer == C.COLOR_TRANSFER_HLG))
+        || (colorInfo.colorSpace == C.COLOR_SPACE_BT709
+            && colorInfo.colorTransfer == C.COLOR_TRANSFER_SDR);
+  }
+
+  private static boolean isDolbyVisionConfigurationRecord(byte[] data) {
+    if (data.length < DOLBY_VISION_MIN_CSD_LENGTH || data[0] != 1) {
+      return false;
+    }
+    int profile = (data[2] & 0xFE) >> 1;
+    return profile == 4
+        || profile == 5
+        || profile == 7
+        || profile == 8
+        || profile == 9
+        || profile == 10;
   }
 
   /**
@@ -1342,6 +1511,7 @@ public final class CodecSpecificDataUtil {
     switch (codecProfileAndLevel.first) {
       case CodecProfileLevel.DolbyVisionProfileDvheDtr: // profile 4
       case CodecProfileLevel.DolbyVisionProfileDvheStn: // profile 5
+      case CodecProfileLevel.DolbyVisionProfileDvheDtb: // profile 7
       case CodecProfileLevel.DolbyVisionProfileDvheSt: // profile 8
         return MimeTypes.VIDEO_H265;
       case CodecProfileLevel.DolbyVisionProfileDvavSe: // profile 9

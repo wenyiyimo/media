@@ -23,6 +23,7 @@ import androidx.media3.common.AuxEffectInfo;
 import androidx.media3.common.C;
 import androidx.media3.common.Effect;
 import androidx.media3.common.Format;
+import androidx.media3.common.MediaChapter;
 import androidx.media3.common.PriorityTaskManager;
 import androidx.media3.common.util.Clock;
 import androidx.media3.common.util.UnstableApi;
@@ -324,6 +325,11 @@ public class StubExoPlayer extends StubPlayer implements ExoPlayer {
   }
 
   @Override
+  public boolean selectChapter(MediaChapter chapter) {
+    throw new UnsupportedOperationException();
+  }
+
+  @Override
   public int getRendererCount() {
     throw new UnsupportedOperationException();
   }
@@ -393,9 +399,24 @@ public class StubExoPlayer extends StubPlayer implements ExoPlayer {
     throw new UnsupportedOperationException();
   }
 
+  @Override
+  public @ExoPlayer.AudioProcessingSupport int getAudioProcessingSupport() {
+    throw new UnsupportedOperationException();
+  }
+
+  @Override
+  public boolean isSkipSilenceSupported() {
+    throw new UnsupportedOperationException();
+  }
+
   @Nullable
   @Override
   public Format getVideoFormat() {
+    throw new UnsupportedOperationException();
+  }
+
+  @Override
+  public @ExoPlayer.VideoEffectsSupport int getVideoEffectsSupport() {
     throw new UnsupportedOperationException();
   }
 

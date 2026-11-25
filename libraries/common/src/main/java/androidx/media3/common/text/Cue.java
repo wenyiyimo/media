@@ -164,6 +164,23 @@ public final class Cue {
   /** Vertical left-to-right (e.g. for Mongolian). */
   public static final int VERTICAL_TYPE_LR = 2;
 
+  /** The collision avoidance behavior for this cue. */
+  @Documented
+  @Retention(RetentionPolicy.SOURCE)
+  @Target({FIELD, METHOD, PARAMETER, LOCAL_VARIABLE, TYPE_USE})
+  @IntDef({COLLISION_AVOIDANCE_NONE, COLLISION_AVOIDANCE_UP, COLLISION_AVOIDANCE_DOWN})
+  @UnstableApi
+  public @interface CollisionAvoidance {}
+
+  /** Do not move this cue to avoid collisions. */
+  @UnstableApi public static final int COLLISION_AVOIDANCE_NONE = 0;
+
+  /** Move this cue upward by the minimum distance needed to avoid collisions. */
+  @UnstableApi public static final int COLLISION_AVOIDANCE_UP = 1;
+
+  /** Move this cue downward by the minimum distance needed to avoid collisions. */
+  @UnstableApi public static final int COLLISION_AVOIDANCE_DOWN = 2;
+
   /**
    * The cue text, or null if this is an image cue. Note the {@link CharSequence} may be decorated
    * with styling spans.
@@ -280,6 +297,15 @@ public final class Cue {
    */
   public final float bitmapHeight;
 
+  /**
+   * The height of the text region as a fraction of the viewport size, or {@link #DIMEN_UNSET} if
+   * unavailable.
+   *
+   * <p>This describes authored layout metadata. Renderers may still size the cue box to its text
+   * content.
+   */
+  @UnstableApi public final float textRegionHeight;
+
   /** Specifies whether or not the {@link #windowColor} property is set. */
   public final boolean windowColorSet;
 
@@ -313,6 +339,9 @@ public final class Cue {
   /** The Z index for cue, the larger index will render above the smaller index. May be negative. */
   @UnstableApi public final int zIndex;
 
+  /** The collision avoidance behavior for this cue. */
+  @UnstableApi public final @CollisionAvoidance int collisionAvoidance;
+
   private Cue(
       @Nullable CharSequence text,
       @Nullable Alignment textAlignment,
@@ -327,11 +356,13 @@ public final class Cue {
       float textSize,
       float size,
       float bitmapHeight,
+      float textRegionHeight,
       boolean windowColorSet,
       int windowColor,
       @VerticalType int verticalType,
       float shearDegrees,
-      int zIndex) {
+      int zIndex,
+      @CollisionAvoidance int collisionAvoidance) {
     // Exactly one of text or bitmap should be set.
     if (text == null) {
       checkNotNull(bitmap);
@@ -355,6 +386,7 @@ public final class Cue {
     this.positionAnchor = positionAnchor;
     this.size = size;
     this.bitmapHeight = bitmapHeight;
+    this.textRegionHeight = textRegionHeight;
     this.windowColorSet = windowColorSet;
     this.windowColor = windowColor;
     this.textSizeType = textSizeType;
@@ -362,6 +394,7 @@ public final class Cue {
     this.verticalType = verticalType;
     this.shearDegrees = shearDegrees;
     this.zIndex = zIndex;
+    this.collisionAvoidance = collisionAvoidance;
   }
 
   /** Returns a new {@link Cue.Builder} initialized with the same values as this Cue. */
@@ -392,13 +425,15 @@ public final class Cue {
         && positionAnchor == that.positionAnchor
         && size == that.size
         && bitmapHeight == that.bitmapHeight
+        && textRegionHeight == that.textRegionHeight
         && windowColorSet == that.windowColorSet
         && windowColor == that.windowColor
         && textSizeType == that.textSizeType
         && textSize == that.textSize
         && verticalType == that.verticalType
         && shearDegrees == that.shearDegrees
-        && zIndex == that.zIndex;
+        && zIndex == that.zIndex
+        && collisionAvoidance == that.collisionAvoidance;
   }
 
   @Override
@@ -415,13 +450,15 @@ public final class Cue {
         positionAnchor,
         size,
         bitmapHeight,
+        textRegionHeight,
         windowColorSet,
         windowColor,
         textSizeType,
         textSize,
         verticalType,
         shearDegrees,
-        zIndex);
+        zIndex,
+        collisionAvoidance);
   }
 
   /** A builder for {@link Cue} objects. */
@@ -440,11 +477,13 @@ public final class Cue {
     private float textSize;
     private float size;
     private float bitmapHeight;
+    private float textRegionHeight;
     private boolean windowColorSet;
     @ColorInt private int windowColor;
     private @VerticalType int verticalType;
     private float shearDegrees;
     private int zIndex;
+    private @CollisionAvoidance int collisionAvoidance;
 
     public Builder() {
       text = null;
@@ -460,9 +499,11 @@ public final class Cue {
       textSize = DIMEN_UNSET;
       size = DIMEN_UNSET;
       bitmapHeight = DIMEN_UNSET;
+      textRegionHeight = DIMEN_UNSET;
       windowColorSet = false;
       windowColor = Color.BLACK;
       verticalType = TYPE_UNSET;
+      collisionAvoidance = COLLISION_AVOIDANCE_NONE;
     }
 
     private Builder(Cue cue) {
@@ -479,11 +520,13 @@ public final class Cue {
       textSize = cue.textSize;
       size = cue.size;
       bitmapHeight = cue.bitmapHeight;
+      textRegionHeight = cue.textRegionHeight;
       windowColorSet = cue.windowColorSet;
       windowColor = cue.windowColor;
       verticalType = cue.verticalType;
       shearDegrees = cue.shearDegrees;
       zIndex = cue.zIndex;
+      collisionAvoidance = cue.collisionAvoidance;
     }
 
     /**
@@ -753,6 +796,27 @@ public final class Cue {
     }
 
     /**
+     * Sets the height of the text region as a fraction of the viewport size.
+     *
+     * @see Cue#textRegionHeight
+     */
+    @CanIgnoreReturnValue
+    public Builder setTextRegionHeight(float textRegionHeight) {
+      this.textRegionHeight = textRegionHeight;
+      return this;
+    }
+
+    /**
+     * Gets the height of the text region as a fraction of the viewport size.
+     *
+     * @see Cue#textRegionHeight
+     */
+    @Pure
+    public float getTextRegionHeight() {
+      return textRegionHeight;
+    }
+
+    /**
      * Sets the fill color of the window.
      *
      * <p>Also sets {@link Cue#windowColorSet} to true.
@@ -835,6 +899,19 @@ public final class Cue {
       return zIndex;
     }
 
+    /** Sets the collision avoidance behavior for this Cue. */
+    @CanIgnoreReturnValue
+    public Builder setCollisionAvoidance(@CollisionAvoidance int collisionAvoidance) {
+      this.collisionAvoidance = collisionAvoidance;
+      return this;
+    }
+
+    /** Gets the collision avoidance behavior for this Cue. */
+    @Pure
+    public @CollisionAvoidance int getCollisionAvoidance() {
+      return collisionAvoidance;
+    }
+
     /** Build the cue. */
     public Cue build() {
       return new Cue(
@@ -851,11 +928,13 @@ public final class Cue {
           textSize,
           size,
           bitmapHeight,
+          textRegionHeight,
           windowColorSet,
           windowColor,
           verticalType,
           shearDegrees,
-          zIndex);
+          zIndex,
+          collisionAvoidance);
     }
   }
 
@@ -879,6 +958,8 @@ public final class Cue {
   private static final String FIELD_VERTICAL_TYPE = Util.intToStringMaxRadix(15);
   private static final String FIELD_SHEAR_DEGREES = Util.intToStringMaxRadix(16);
   private static final String FIELD_Z_INDEX = Util.intToStringMaxRadix(19);
+  private static final String FIELD_COLLISION_AVOIDANCE = Util.intToStringMaxRadix(20);
+  private static final String FIELD_TEXT_REGION_HEIGHT = Util.intToStringMaxRadix(21);
 
   /**
    * Returns a {@link Bundle} that can be serialized to bytes.
@@ -950,11 +1031,13 @@ public final class Cue {
     bundle.putFloat(FIELD_TEXT_SIZE, textSize);
     bundle.putFloat(FIELD_SIZE, size);
     bundle.putFloat(FIELD_BITMAP_HEIGHT, bitmapHeight);
+    bundle.putFloat(FIELD_TEXT_REGION_HEIGHT, textRegionHeight);
     bundle.putBoolean(FIELD_WINDOW_COLOR_SET, windowColorSet);
     bundle.putInt(FIELD_WINDOW_COLOR, windowColor);
     bundle.putInt(FIELD_VERTICAL_TYPE, verticalType);
     bundle.putFloat(FIELD_SHEAR_DEGREES, shearDegrees);
     bundle.putInt(FIELD_Z_INDEX, zIndex);
+    bundle.putInt(FIELD_COLLISION_AVOIDANCE, collisionAvoidance);
     return bundle;
   }
 
@@ -1015,6 +1098,9 @@ public final class Cue {
     if (bundle.containsKey(FIELD_BITMAP_HEIGHT)) {
       builder.setBitmapHeight(bundle.getFloat(FIELD_BITMAP_HEIGHT));
     }
+    if (bundle.containsKey(FIELD_TEXT_REGION_HEIGHT)) {
+      builder.setTextRegionHeight(bundle.getFloat(FIELD_TEXT_REGION_HEIGHT));
+    }
     if (bundle.containsKey(FIELD_WINDOW_COLOR)) {
       builder.setWindowColor(bundle.getInt(FIELD_WINDOW_COLOR));
     }
@@ -1029,6 +1115,9 @@ public final class Cue {
     }
     if (bundle.containsKey(FIELD_Z_INDEX)) {
       builder.setZIndex(bundle.getInt(FIELD_Z_INDEX));
+    }
+    if (bundle.containsKey(FIELD_COLLISION_AVOIDANCE)) {
+      builder.setCollisionAvoidance(bundle.getInt(FIELD_COLLISION_AVOIDANCE));
     }
     return builder.build();
   }

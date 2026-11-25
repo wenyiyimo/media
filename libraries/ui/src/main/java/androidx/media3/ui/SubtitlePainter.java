@@ -53,9 +53,7 @@ import org.checkerframework.checker.nullness.qual.RequiresNonNull;
   private static final float INNER_PADDING_RATIO = 0.125f;
 
   // Styled dimensions.
-  private final float outlineWidth;
-  private final float shadowRadius;
-  private final float shadowOffset;
+  private final float density;
   private final float spacingMult;
   private final float spacingAdd;
 
@@ -79,9 +77,14 @@ import org.checkerframework.checker.nullness.qual.RequiresNonNull;
   private int windowColor;
   private int edgeColor;
   private @CaptionStyleCompat.EdgeType int edgeType;
+  private float outlineWidth;
+  private float shadowRadius;
+  private float shadowOffset;
   private float defaultTextSizePx;
   private float cueTextSizePx;
   private float bottomPaddingFraction;
+  private float bottomPosition;
+  private int bottomPositionReferenceHeight;
   private int parentLeft;
   private int parentTop;
   private int parentRight;
@@ -94,6 +97,7 @@ import org.checkerframework.checker.nullness.qual.RequiresNonNull;
   private int textTop;
   private int textPaddingX;
   private @MonotonicNonNull Rect bitmapRect;
+  private int verticalOffset;
 
   @SuppressWarnings("ResourceType")
   public SubtitlePainter(Context context) {
@@ -105,10 +109,10 @@ import org.checkerframework.checker.nullness.qual.RequiresNonNull;
 
     Resources resources = context.getResources();
     DisplayMetrics displayMetrics = resources.getDisplayMetrics();
-    int twoDpInPx = Math.round((2f * displayMetrics.densityDpi) / DisplayMetrics.DENSITY_DEFAULT);
-    outlineWidth = twoDpInPx;
-    shadowRadius = twoDpInPx;
-    shadowOffset = twoDpInPx;
+    density = displayMetrics.density;
+    outlineWidth = dpToPx(CaptionStyleCompat.DEFAULT_EDGE_WIDTH);
+    shadowRadius = dpToPx(CaptionStyleCompat.DEFAULT_SHADOW_OFFSET);
+    shadowOffset = dpToPx(CaptionStyleCompat.DEFAULT_SHADOW_OFFSET);
 
     textPaint = new TextPaint();
     textPaint.setAntiAlias(true);
@@ -124,7 +128,7 @@ import org.checkerframework.checker.nullness.qual.RequiresNonNull;
   }
 
   /**
-   * Draws the provided {@link Cue} into a canvas with the specified styling.
+   * Lays out the provided {@link Cue} with the specified styling.
    *
    * <p>A call to this method is able to use cached results of calculations made during the previous
    * call, and so an instance of this class is able to optimize repeated calls to this method in
@@ -137,28 +141,36 @@ import org.checkerframework.checker.nullness.qual.RequiresNonNull;
    * @param cueTextSizePx The embedded text size of this cue, in pixels.
    * @param bottomPaddingFraction The bottom padding fraction to apply when {@link Cue#line} is
    *     {@link Cue#DIMEN_UNSET}, as a fraction of the viewport height
-   * @param canvas The canvas into which to draw.
+   * @param bottomPosition The vertical subtitle adjustment as a fraction.
+   * @param bottomPositionReferenceHeight The height used to resolve {@code bottomPosition}.
    * @param cueBoxLeft The left position of the enclosing cue box.
    * @param cueBoxTop The top position of the enclosing cue box.
    * @param cueBoxRight The right position of the enclosing cue box.
    * @param cueBoxBottom The bottom position of the enclosing cue box.
    */
-  public void draw(
+  public void layout(
       Cue cue,
       CaptionStyleCompat style,
       float defaultTextSizePx,
       float cueTextSizePx,
       float bottomPaddingFraction,
-      Canvas canvas,
+      float bottomPosition,
+      int bottomPositionReferenceHeight,
       int cueBoxLeft,
       int cueBoxTop,
       int cueBoxRight,
       int cueBoxBottom) {
+    verticalOffset = 0;
     boolean isTextCue = cue.bitmap == null;
     int windowColor = Color.BLACK;
     if (isTextCue) {
       if (TextUtils.isEmpty(cue.text)) {
         // Nothing to draw.
+        cueText = null;
+        cueBitmap = null;
+        textLayout = null;
+        edgeLayout = null;
+        bitmapRect = null;
         return;
       }
       windowColor = cue.windowColorSet ? cue.windowColor : style.windowColor;
@@ -179,15 +191,19 @@ import org.checkerframework.checker.nullness.qual.RequiresNonNull;
         && this.edgeType == style.edgeType
         && this.edgeColor == style.edgeColor
         && Objects.equals(this.textPaint.getTypeface(), style.typeface)
+        && this.outlineWidth == getOutlineWidthPx(style)
+        && this.shadowRadius == getShadowRadiusPx(style)
+        && this.shadowOffset == getShadowOffsetPx(style)
         && this.defaultTextSizePx == defaultTextSizePx
         && this.cueTextSizePx == cueTextSizePx
         && this.bottomPaddingFraction == bottomPaddingFraction
+        && this.bottomPosition == bottomPosition
+        && this.bottomPositionReferenceHeight == bottomPositionReferenceHeight
         && this.parentLeft == cueBoxLeft
         && this.parentTop == cueBoxTop
         && this.parentRight == cueBoxRight
         && this.parentBottom == cueBoxBottom) {
       // We can use the cached layout.
-      drawLayout(canvas, isTextCue);
       return;
     }
 
@@ -207,13 +223,21 @@ import org.checkerframework.checker.nullness.qual.RequiresNonNull;
     this.edgeType = style.edgeType;
     this.edgeColor = style.edgeColor;
     this.textPaint.setTypeface(style.typeface);
+    this.outlineWidth = getOutlineWidthPx(style);
+    this.shadowRadius = getShadowRadiusPx(style);
+    this.shadowOffset = getShadowOffsetPx(style);
     this.defaultTextSizePx = defaultTextSizePx;
     this.cueTextSizePx = cueTextSizePx;
     this.bottomPaddingFraction = bottomPaddingFraction;
+    this.bottomPosition = bottomPosition;
+    this.bottomPositionReferenceHeight = bottomPositionReferenceHeight;
     this.parentLeft = cueBoxLeft;
     this.parentTop = cueBoxTop;
     this.parentRight = cueBoxRight;
     this.parentBottom = cueBoxBottom;
+    textLayout = null;
+    edgeLayout = null;
+    bitmapRect = null;
 
     if (isTextCue) {
       checkNotNull(cueText);
@@ -222,7 +246,30 @@ import org.checkerframework.checker.nullness.qual.RequiresNonNull;
       checkNotNull(cueBitmap);
       setupBitmapLayout();
     }
-    drawLayout(canvas, isTextCue);
+  }
+
+  /** Draws the most recently laid out cue. */
+  public void draw(Canvas canvas) {
+    drawLayout(canvas, cueBitmap == null);
+  }
+
+  /** Returns the laid out cue bounds used for collision detection. */
+  @Nullable
+  public Rect getCollisionBounds() {
+    if (textLayout == null) {
+      return null;
+    }
+    int edgePadding = getCollisionEdgePadding();
+    return new Rect(
+        textLeft - textPaddingX - edgePadding,
+        textTop + verticalOffset - edgePadding,
+        textLeft + textLayout.getWidth() + textPaddingX + edgePadding,
+        textTop + verticalOffset + textLayout.getHeight() + edgePadding);
+  }
+
+  /** Applies a vertical collision-avoidance offset to the laid out cue. */
+  public void setVerticalOffset(int verticalOffset) {
+    this.verticalOffset = verticalOffset;
   }
 
   @RequiresNonNull("cueText")
@@ -357,6 +404,8 @@ import org.checkerframework.checker.nullness.qual.RequiresNonNull;
       textTop = parentBottom - textHeight - (int) (parentHeight * bottomPaddingFraction);
     }
 
+    textTop = textTop - (int) (bottomPositionReferenceHeight * bottomPosition);
+
     // Update the derived drawing variables.
     this.textLayout =
         new StaticLayout(
@@ -375,7 +424,8 @@ import org.checkerframework.checker.nullness.qual.RequiresNonNull;
     int parentWidth = parentRight - parentLeft;
     int parentHeight = parentBottom - parentTop;
     float anchorX = parentLeft + (parentWidth * cuePosition);
-    float anchorY = parentTop + (parentHeight * cueLine);
+    float anchorY =
+        parentTop + (parentHeight * cueLine) - (bottomPositionReferenceHeight * bottomPosition);
     int width = Math.round(parentWidth * cueSize);
     int height =
         cueBitmapHeight != Cue.DIMEN_UNSET
@@ -413,7 +463,7 @@ import org.checkerframework.checker.nullness.qual.RequiresNonNull;
     }
 
     int saveCount = canvas.save();
-    canvas.translate(textLeft, textTop);
+    canvas.translate(textLeft, textTop + verticalOffset);
 
     if (Color.alpha(windowColor) > 0) {
       windowPaint.setColor(windowColor);
@@ -457,6 +507,39 @@ import org.checkerframework.checker.nullness.qual.RequiresNonNull;
   @RequiresNonNull({"cueBitmap", "bitmapRect"})
   private void drawBitmapLayout(Canvas canvas) {
     canvas.drawBitmap(cueBitmap, /* src= */ null, bitmapRect, bitmapPaint);
+  }
+
+  private int getCollisionEdgePadding() {
+    if (edgeType == CaptionStyleCompat.EDGE_TYPE_OUTLINE) {
+      return (int) Math.ceil(outlineWidth / 2f);
+    }
+    if (edgeType == CaptionStyleCompat.EDGE_TYPE_DROP_SHADOW) {
+      return (int) Math.ceil(shadowRadius + Math.abs(shadowOffset));
+    }
+    if (edgeType == CaptionStyleCompat.EDGE_TYPE_RAISED
+        || edgeType == CaptionStyleCompat.EDGE_TYPE_DEPRESSED) {
+      return (int) Math.ceil(shadowRadius);
+    }
+    return 0;
+  }
+
+  private float getOutlineWidthPx(CaptionStyleCompat style) {
+    return dpToPx(style.edgeWidth);
+  }
+
+  private float getShadowRadiusPx(CaptionStyleCompat style) {
+    return dpToPx(style.shadowOffset);
+  }
+
+  private float getShadowOffsetPx(CaptionStyleCompat style) {
+    return dpToPx(style.shadowOffset);
+  }
+
+  private float dpToPx(float dp) {
+    if (Float.isNaN(dp) || Float.isInfinite(dp) || dp <= 0f) {
+      return 0f;
+    }
+    return dp * density;
   }
 
   /**

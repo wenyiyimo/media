@@ -37,6 +37,7 @@ import androidx.media3.common.Label;
 import androidx.media3.common.Metadata;
 import androidx.media3.common.MimeTypes;
 import androidx.media3.common.ParserException;
+import androidx.media3.common.util.CodecSpecificDataUtil;
 import androidx.media3.common.util.Log;
 import androidx.media3.common.util.NullableType;
 import androidx.media3.common.util.ParsableByteArray;
@@ -46,6 +47,7 @@ import androidx.media3.common.util.WavUtil;
 import androidx.media3.container.DolbyVisionConfig;
 import androidx.media3.container.NalUnitUtil;
 import androidx.media3.extractor.AacUtil;
+import androidx.media3.extractor.Ac3Util;
 import androidx.media3.extractor.Av1Config;
 import androidx.media3.extractor.AvcConfig;
 import androidx.media3.extractor.ChunkIndex;
@@ -84,6 +86,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
+import java.util.zip.Inflater;
 import org.checkerframework.checker.nullness.qual.EnsuresNonNull;
 import org.checkerframework.checker.nullness.qual.MonotonicNonNull;
 import org.checkerframework.checker.nullness.qual.RequiresNonNull;
@@ -322,6 +325,9 @@ public class MatroskaExtractor implements Extractor {
   private static final int LACING_EBML = 3;
 
   private static final int FOURCC_COMPRESSION_DIVX = 0x58564944;
+  private static final int FOURCC_COMPRESSION_DX50 = 0x30355844;
+  private static final int FOURCC_COMPRESSION_XVID = 0x44495658;
+  private static final int FOURCC_COMPRESSION_FMP4 = 0x34504d46;
   private static final int FOURCC_COMPRESSION_H263 = 0x33363248;
   private static final int FOURCC_COMPRESSION_VC1 = 0x31435657;
 
@@ -464,6 +470,7 @@ public class MatroskaExtractor implements Extractor {
   private final ParsableByteArray seekEntryIdBytes;
   private final ParsableByteArray sampleStrippedBytes;
   private final ParsableByteArray subtitleSample;
+  private final ParsableByteArray inflatedSubtitleSample;
   private final ParsableByteArray encryptionInitializationVector;
   private final ParsableByteArray encryptionSubsampleData;
   private final ParsableByteArray supplementalData;
@@ -479,6 +486,9 @@ public class MatroskaExtractor implements Extractor {
 
   // The chapter corresponding to the current EditionEntry element, or null.
   @Nullable private ChapterEntry currentChapter;
+
+  // Inflater for zlib compressed tracks
+  @Nullable private Inflater inflater;
 
   // The track corresponding to the current TrackEntry element, or null.
   @Nullable private Track currentTrack;
@@ -596,6 +606,7 @@ public class MatroskaExtractor implements Extractor {
     nalLength = new ParsableByteArray(4);
     sampleStrippedBytes = new ParsableByteArray();
     subtitleSample = new ParsableByteArray();
+    inflatedSubtitleSample = new ParsableByteArray();
     encryptionInitializationVector = new ParsableByteArray(ENCRYPTION_IV_SIZE);
     encryptionSubsampleData = new ParsableByteArray();
     supplementalData = new ParsableByteArray();
@@ -873,6 +884,9 @@ public class MatroskaExtractor implements Extractor {
       case ID_CONTENT_ENCODING:
         // TODO: check and fail if more than one content encoding is present.
         break;
+      case ID_CONTENT_COMPRESSION:
+        getCurrentTrack(id).hasContentCompression = true;
+        break;
       case ID_CONTENT_ENCRYPTION:
         getCurrentTrack(id).hasContentEncryption = true;
         break;
@@ -950,8 +964,8 @@ public class MatroskaExtractor implements Extractor {
           inCuesElement = false;
           for (int i = 0; i < tracks.size(); i++) {
             Track track = tracks.valueAt(i);
-            if (!track.waitingForDtsAnalysis) {
-              updateTrackFormatWithMetadata(track);
+            updateTrackFormatWithMetadata(track);
+            if (!track.waitingForSampleFormat) {
               track.assertOutputInitialized();
               track.output.format(checkNotNull(track.format));
             }
@@ -1106,9 +1120,9 @@ public class MatroskaExtractor implements Extractor {
           }
 
           if (maybeSendFormatsEarly) {
-            if (!trackItem.waitingForDtsAnalysis) {
-              updateTrackFormatWithMetadata(trackItem);
-              trackItem.assertOutputInitialized();
+            updateTrackFormatWithMetadata(trackItem);
+            trackItem.assertOutputInitialized();
+            if (!trackItem.waitingForSampleFormat) {
               trackItem.output.format(checkNotNull(trackItem.format));
             }
           }
@@ -1270,8 +1284,8 @@ public class MatroskaExtractor implements Extractor {
         }
         break;
       case ID_CONTENT_COMPRESSION_ALGORITHM:
-        // This extractor only supports header stripping.
-        if (value != 3) {
+        // This extractor only supports header stripping and zlib compressed text tracks.
+        if (value != 3 && (value != 0 || getCurrentTrack(id).type != C.TRACK_TYPE_TEXT)) {
           throw ParserException.createForMalformedContainer(
               "ContentCompAlgo " + value + " not supported", /* cause= */ null);
         }
@@ -1848,22 +1862,25 @@ public class MatroskaExtractor implements Extractor {
   private int writeSampleData(ExtractorInput input, Track track, int size, boolean isBlockGroup)
       throws IOException {
     if (CODEC_ID_SUBRIP.equals(track.codecId)) {
-      writeSubtitleSampleData(input, SUBRIP_PREFIX, size);
+      writeSubtitleSampleData(input, SUBRIP_PREFIX, size, track.hasContentCompression);
       return finishWriteSampleData();
     } else if (CODEC_ID_ASS.equals(track.codecId) || CODEC_ID_SSA.equals(track.codecId)) {
-      writeSubtitleSampleData(input, SSA_PREFIX, size);
+      writeSubtitleSampleData(input, SSA_PREFIX, size, track.hasContentCompression);
       return finishWriteSampleData();
     } else if (CODEC_ID_VTT.equals(track.codecId)) {
-      writeSubtitleSampleData(input, VTT_PREFIX, size);
+      writeSubtitleSampleData(input, VTT_PREFIX, size, track.hasContentCompression);
       return finishWriteSampleData();
     }
 
-    if (track.waitingForDtsAnalysis) {
+    if (track.waitingForSampleFormat && CODEC_ID_DTS.equals(track.codecId)) {
       checkNotNull(track.format);
       track.format = DtsUtil.updateFormatWithDtsHdInfo(input, size, track.format);
-      track.output.format(track.format);
-      track.waitingForDtsAnalysis = false;
-      maybeEndTracks();
+      finishSampleFormatAnalysis(track);
+    }
+
+    if (track.waitingForSampleFormat && CODEC_ID_E_AC3.equals(track.codecId)) {
+      track.format = Ac3Util.updateFormatWithEac3JocInfo(input, size, checkNotNull(track.format));
+      finishSampleFormatAnalysis(track);
     }
 
     TrackOutput output = track.output;
@@ -2018,6 +2035,20 @@ public class MatroskaExtractor implements Extractor {
       if (track.trueHdSampleRechunker != null) {
         checkState(sampleStrippedBytes.limit() == 0);
         track.trueHdSampleRechunker.startSample(input);
+        if (track.trueHdSampleRechunker.hasSyncFrame()) {
+          Format format = checkNotNull(track.format);
+          boolean formatChanged = false;
+          if (track.trueHdSampleRechunker.isAtmos()
+              && !MimeTypes.CODEC_TRUEHD_ATMOS.equals(format.codecs)) {
+            track.format = format.buildUpon().setCodecs(MimeTypes.CODEC_TRUEHD_ATMOS).build();
+            formatChanged = true;
+          }
+          if (track.waitingForSampleFormat) {
+            finishSampleFormatAnalysis(track);
+          } else if (formatChanged) {
+            track.output.format(checkNotNull(track.format));
+          }
+        }
       }
       while (sampleBytesRead < size) {
         int bytesWritten = writeToOutput(input, output, size - sampleBytesRead);
@@ -2067,7 +2098,8 @@ public class MatroskaExtractor implements Extractor {
     sampleStrippedBytes.reset(/* limit= */ 0);
   }
 
-  private void writeSubtitleSampleData(ExtractorInput input, byte[] samplePrefix, int size)
+  private void writeSubtitleSampleData(
+      ExtractorInput input, byte[] samplePrefix, int size, boolean hasContentCompression)
       throws IOException {
     int sizeWithPrefix = samplePrefix.length + size;
     if (subtitleSample.capacity() < sizeWithPrefix) {
@@ -2078,6 +2110,25 @@ public class MatroskaExtractor implements Extractor {
       System.arraycopy(samplePrefix, 0, subtitleSample.getData(), 0, samplePrefix.length);
     }
     input.readFully(subtitleSample.getData(), samplePrefix.length, size);
+
+    if (hasContentCompression) {
+      if (inflater == null) {
+        inflater = new Inflater();
+      }
+      subtitleSample.setPosition(samplePrefix.length);
+      subtitleSample.setLimit(sizeWithPrefix);
+      if (Util.maybeInflate(subtitleSample, inflatedSubtitleSample, inflater)) {
+        sizeWithPrefix = samplePrefix.length + inflatedSubtitleSample.limit();
+        subtitleSample.ensureCapacity(sizeWithPrefix);
+        System.arraycopy(
+            inflatedSubtitleSample.getData(),
+            0,
+            subtitleSample.getData(),
+            samplePrefix.length,
+            inflatedSubtitleSample.limit());
+      }
+    }
+
     subtitleSample.setPosition(0);
     subtitleSample.setLimit(sizeWithPrefix);
     // Defer writing the data to the track output. We need to modify the sample data by setting
@@ -2297,7 +2348,7 @@ public class MatroskaExtractor implements Extractor {
       return;
     }
     for (int i = 0; i < tracks.size(); i++) {
-      if (tracks.valueAt(i).waitingForDtsAnalysis) {
+      if (tracks.valueAt(i).waitingForSampleFormat) {
         return;
       }
     }
@@ -2309,6 +2360,13 @@ public class MatroskaExtractor implements Extractor {
     track.maybeAddChaptersMetadata(chapters);
     track.maybeAddThumbnailMetadata(
         perTrackCues, durationUs, segmentContentPosition, segmentContentSize);
+  }
+
+  private void finishSampleFormatAnalysis(Track track) {
+    updateTrackFormatWithMetadata(track);
+    track.output.format(checkNotNull(track.format));
+    track.waitingForSampleFormat = false;
+    maybeEndTracks();
   }
 
   /** Passes events through to the outer {@link MatroskaExtractor}. */
@@ -2379,6 +2437,8 @@ public class MatroskaExtractor implements Extractor {
 
     private static final int DISPLAY_UNIT_PIXELS = 0;
     private static final int MAX_CHROMATICITY = 50_000; // Defined in CTA-861.3.
+    // CTA-861.3 stores minimum mastering luminance in units of 0.0001 cd/m2.
+    private static final int MIN_MASTERING_LUMINANCE_SCALE = 10_000;
 
     /** Default max content light level (CLL) that should be encoded into hdrStaticInfo. */
     private static final int DEFAULT_MAX_CLL = 1000; // nits.
@@ -2396,6 +2456,7 @@ public class MatroskaExtractor implements Extractor {
     public int defaultSampleDurationNs;
     public int maxBlockAdditionId;
     private int blockAddIdType;
+    public boolean hasContentCompression;
     public boolean hasContentEncryption;
     public byte @MonotonicNonNull [] sampleStrippedBytes;
     public TrackOutput.@MonotonicNonNull CryptoData cryptoData;
@@ -2440,7 +2501,7 @@ public class MatroskaExtractor implements Extractor {
     public long codecDelayNs = 0;
     public long seekPreRollNs = 0;
     public @MonotonicNonNull TrueHdSampleRechunker trueHdSampleRechunker;
-    public boolean waitingForDtsAnalysis = false;
+    public boolean waitingForSampleFormat;
     private boolean chaptersMetadataAdded;
     private boolean thumbnailMetadataAdded;
 
@@ -2577,20 +2638,22 @@ public class MatroskaExtractor implements Extractor {
           break;
         case CODEC_ID_E_AC3:
           mimeType = MimeTypes.AUDIO_E_AC3;
+          waitingForSampleFormat = !hasContentEncryption && sampleStrippedBytes == null;
           break;
         case CODEC_ID_TRUEHD:
           mimeType = MimeTypes.AUDIO_TRUEHD;
           trueHdSampleRechunker = new TrueHdSampleRechunker();
+          waitingForSampleFormat = !hasContentEncryption && sampleStrippedBytes == null;
           break;
         case CODEC_ID_DTS:
           mimeType = MimeTypes.AUDIO_DTS; // temporary
-          waitingForDtsAnalysis = true;
+          waitingForSampleFormat = true;
           break;
         case CODEC_ID_DTS_EXPRESS:
           mimeType = MimeTypes.AUDIO_DTS_EXPRESS;
           break;
         case CODEC_ID_DTS_LOSSLESS:
-          mimeType = MimeTypes.AUDIO_DTS_HD;
+          mimeType = MimeTypes.AUDIO_MEDIA3_DTS_HD_MA_CORELESS;
           break;
         case CODEC_ID_FLAC:
           mimeType = MimeTypes.AUDIO_FLAC;
@@ -2706,6 +2769,9 @@ public class MatroskaExtractor implements Extractor {
         if (dolbyVisionConfig != null) {
           codecs = dolbyVisionConfig.codecs;
           mimeType = MimeTypes.VIDEO_DOLBY_VISION;
+          initializationData =
+              CodecSpecificDataUtil.setDolbyVisionCsd(
+                  initializationData, this.dolbyVisionConfigBytes);
         }
       }
 
@@ -2888,7 +2954,8 @@ public class MatroskaExtractor implements Extractor {
       hdrStaticInfo.putShort((short) ((whitePointChromaticityX * MAX_CHROMATICITY) + 0.5f));
       hdrStaticInfo.putShort((short) ((whitePointChromaticityY * MAX_CHROMATICITY) + 0.5f));
       hdrStaticInfo.putShort((short) (maxMasteringLuminance + 0.5f));
-      hdrStaticInfo.putShort((short) (minMasteringLuminance + 0.5f));
+      hdrStaticInfo.putShort(
+          (short) ((minMasteringLuminance * MIN_MASTERING_LUMINANCE_SCALE) + 0.5f));
       hdrStaticInfo.putShort((short) maxContentLuminance);
       hdrStaticInfo.putShort((short) maxFrameAverageLuminance);
       return hdrStaticInfoData;
@@ -3007,6 +3074,8 @@ public class MatroskaExtractor implements Extractor {
         }
       }
       if (!chapters.isEmpty()) {
+        chapters.sort(
+            (first, second) -> Long.compare(first.getStartTimeMs(), second.getStartTimeMs()));
         format =
             checkNotNull(format)
                 .buildUpon()
@@ -3032,8 +3101,11 @@ public class MatroskaExtractor implements Extractor {
       try {
         buffer.skipBytes(16); // size(4), width(4), height(4), planes(2), bitcount(2).
         long compression = buffer.readLittleEndianUnsignedInt();
-        if (compression == FOURCC_COMPRESSION_DIVX) {
-          return new Pair<>(MimeTypes.VIDEO_DIVX, null);
+        if (compression == FOURCC_COMPRESSION_DIVX
+            || compression == FOURCC_COMPRESSION_DX50
+            || compression == FOURCC_COMPRESSION_XVID
+            || compression == FOURCC_COMPRESSION_FMP4) {
+          return new Pair<>(MimeTypes.VIDEO_MP4V, null);
         } else if (compression == FOURCC_COMPRESSION_H263) {
           return new Pair<>(MimeTypes.VIDEO_H263, null);
         } else if (compression == FOURCC_COMPRESSION_VC1) {

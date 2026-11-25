@@ -22,6 +22,7 @@ import static java.lang.annotation.RetentionPolicy.SOURCE;
 import android.content.Context;
 import android.content.res.Resources;
 import android.graphics.Canvas;
+import android.graphics.Rect;
 import android.util.AttributeSet;
 import android.util.TypedValue;
 import android.view.View;
@@ -72,7 +73,15 @@ public final class SubtitleView extends FrameLayout {
         CaptionStyleCompat style,
         float defaultTextSize,
         @Cue.TextSizeType int defaultTextSizeType,
-        float bottomPaddingFraction);
+        float bottomPaddingFraction,
+        float bottomPosition);
+
+    /**
+     * Sets the video bounds within the subtitle view.
+     *
+     * @param videoViewport The video bounds, or an empty rect to use the output view bounds.
+     */
+    default void setVideoViewport(Rect videoViewport) {}
   }
 
   /**
@@ -121,13 +130,19 @@ public final class SubtitleView extends FrameLayout {
   private CaptionStyleCompat style;
   private @Cue.TextSizeType int defaultTextSizeType;
   private float defaultTextSize;
+  private float textSizeScale;
   private float bottomPaddingFraction;
+  private float bottomPosition;
+  private final Rect videoViewport;
   private boolean applyEmbeddedStyles;
   private boolean applyEmbeddedFontSizes;
 
   private @ViewType int viewType;
   private Output output;
   private View innerSubtitleView;
+
+  private static final long BITMAP_CUE_CLEAR_DELAY_MS = 100;
+  @Nullable private Runnable pendingClearRunnable;
 
   public SubtitleView(Context context) {
     this(context, null);
@@ -142,6 +157,9 @@ public final class SubtitleView extends FrameLayout {
     bottomPaddingFraction = DEFAULT_BOTTOM_PADDING_FRACTION;
     applyEmbeddedStyles = true;
     applyEmbeddedFontSizes = true;
+    textSizeScale = 1.0f;
+    bottomPosition = 0;
+    videoViewport = new Rect();
 
     CanvasSubtitleOutput canvasSubtitleOutput = new CanvasSubtitleOutput(context);
     output = canvasSubtitleOutput;
@@ -156,8 +174,56 @@ public final class SubtitleView extends FrameLayout {
    * @param cues The cues to display, or null to clear the cues.
    */
   public void setCues(@Nullable List<Cue> cues) {
-    this.cues = (cues != null ? cues : Collections.emptyList());
+    List<Cue> newCues = cues != null ? new ArrayList<>(cues) : Collections.emptyList();
+    if (newCues.isEmpty() && containsBitmap(this.cues)) {
+      if (pendingClearRunnable == null) {
+        scheduleBitmapCueClear();
+      }
+      return;
+    }
+    if (newCues.size() > 1) {
+      Collections.sort(
+          newCues, (firstCue, secondCue) -> Integer.compare(firstCue.zIndex, secondCue.zIndex));
+    }
+    cancelPendingBitmapCueClear();
+    this.cues = newCues;
     updateOutput();
+  }
+
+  private boolean containsBitmap(List<Cue> cues) {
+    for (Cue cue : cues) {
+      if (cue.bitmap != null) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private void scheduleBitmapCueClear() {
+    postDelayed(pendingClearRunnable = this::onBitmapCueClearTimeout, BITMAP_CUE_CLEAR_DELAY_MS);
+  }
+
+  private void onBitmapCueClearTimeout() {
+    pendingClearRunnable = null;
+    cues = Collections.emptyList();
+    updateOutput();
+  }
+
+  private void cancelPendingBitmapCueClear() {
+    if (pendingClearRunnable != null) {
+      removeCallbacks(pendingClearRunnable);
+      pendingClearRunnable = null;
+    }
+  }
+
+  @Override
+  protected void onDetachedFromWindow() {
+    if (pendingClearRunnable != null) {
+      cancelPendingBitmapCueClear();
+      cues = Collections.emptyList();
+      updateOutput();
+    }
+    super.onDetachedFromWindow();
   }
 
   /**
@@ -192,6 +258,7 @@ public final class SubtitleView extends FrameLayout {
     }
     innerSubtitleView = view;
     output = view;
+    output.setVideoViewport(videoViewport);
     addView(view);
   }
 
@@ -258,6 +325,7 @@ public final class SubtitleView extends FrameLayout {
   private void setTextSize(@Cue.TextSizeType int textSizeType, float textSize) {
     this.defaultTextSizeType = textSizeType;
     this.defaultTextSize = textSize;
+    this.textSizeScale = 1.0f;
     updateOutput();
   }
 
@@ -281,6 +349,18 @@ public final class SubtitleView extends FrameLayout {
   public void setApplyEmbeddedFontSizes(boolean applyEmbeddedFontSizes) {
     this.applyEmbeddedFontSizes = applyEmbeddedFontSizes;
     updateOutput();
+  }
+
+  /** Sets a scale factor applied to subtitle sizes regardless of cue format. */
+  public void setTextSizeScale(float textSizeScale) {
+    applyTextSizeScale(textSizeScale);
+    updateOutput();
+  }
+
+  private void applyTextSizeScale(float textSizeScale) {
+    defaultTextSizeType = Cue.TEXT_SIZE_TYPE_FRACTIONAL;
+    defaultTextSize = DEFAULT_TEXT_SIZE_FRACTION * textSizeScale;
+    this.textSizeScale = textSizeScale;
   }
 
   /**
@@ -317,6 +397,22 @@ public final class SubtitleView extends FrameLayout {
     updateOutput();
   }
 
+  public void setBottomPosition(float bottomPosition) {
+    this.bottomPosition = bottomPosition;
+    updateOutput();
+  }
+
+  /* package */ void setVideoViewport(int left, int top, int right, int bottom) {
+    if (videoViewport.left == left
+        && videoViewport.top == top
+        && videoViewport.right == right
+        && videoViewport.bottom == bottom) {
+      return;
+    }
+    videoViewport.set(left, top, right, bottom);
+    output.setVideoViewport(videoViewport);
+  }
+
   private float getUserCaptionFontScale() {
     if (isInEditMode()) {
       return 1f;
@@ -347,7 +443,8 @@ public final class SubtitleView extends FrameLayout {
         style,
         defaultTextSize,
         defaultTextSizeType,
-        bottomPaddingFraction);
+        bottomPaddingFraction,
+        bottomPosition);
   }
 
   /**
@@ -363,23 +460,37 @@ public final class SubtitleView extends FrameLayout {
    * to {@link Cue#DIMEN_UNSET}
    */
   private List<Cue> getCuesWithStylingPreferencesApplied() {
-    if (applyEmbeddedStyles && applyEmbeddedFontSizes) {
+    boolean scaleCues = textSizeScale != 1.0f;
+    if (applyEmbeddedStyles && applyEmbeddedFontSizes && !scaleCues) {
       return cues;
     }
     List<Cue> strippedCues = new ArrayList<>(cues.size());
     for (int i = 0; i < cues.size(); i++) {
-      strippedCues.add(removeEmbeddedStyling(cues.get(i)));
+      Cue cue = cues.get(i);
+      if (scaleCues) {
+        cue = SubtitleViewUtils.scaleRegionTextCue(cue, cues, textSizeScale);
+        cue = SubtitleViewUtils.scaleBitmapCue(cue, textSizeScale);
+      }
+      strippedCues.add(applyEmbeddedStylingPreferences(cue));
     }
     return strippedCues;
   }
 
-  private Cue removeEmbeddedStyling(Cue cue) {
-    Cue.Builder strippedCue = cue.buildUpon();
+  private Cue applyEmbeddedStylingPreferences(Cue cue) {
+    Cue.Builder cueBuilder = cue.buildUpon();
     if (!applyEmbeddedStyles) {
-      SubtitleViewUtils.removeAllEmbeddedStyling(strippedCue);
+      SubtitleViewUtils.removeAllEmbeddedStyling(cueBuilder);
     } else if (!applyEmbeddedFontSizes) {
-      SubtitleViewUtils.removeEmbeddedFontSizes(strippedCue);
+      SubtitleViewUtils.removeEmbeddedFontSizes(cueBuilder);
+    } else if (textSizeScale != 1.0f) {
+      SubtitleViewUtils.scaleEmbeddedFontSizes(cueBuilder, textSizeScale);
     }
-    return strippedCue.build();
+    return cueBuilder.build();
+  }
+
+  public void reset() {
+    applyTextSizeScale(1.0f);
+    bottomPosition = 0;
+    updateOutput();
   }
 }

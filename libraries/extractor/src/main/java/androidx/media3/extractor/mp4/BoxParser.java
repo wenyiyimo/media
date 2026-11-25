@@ -52,6 +52,7 @@ import androidx.media3.extractor.AacUtil;
 import androidx.media3.extractor.Ac3Util;
 import androidx.media3.extractor.Ac4Util;
 import androidx.media3.extractor.Av1Config;
+import androidx.media3.extractor.Av3aUtil;
 import androidx.media3.extractor.AvcConfig;
 import androidx.media3.extractor.ExtractorUtil;
 import androidx.media3.extractor.GaplessInfoHolder;
@@ -756,10 +757,14 @@ public final class BoxParser {
           sampleCount);
     }
 
+    ImmutableLongArray editListMediaTimes = checkNotNull(track.editListMediaTimes);
+    boolean ignoreBadAudioEdit = hasBadAudioEdit(track, duration, editListMediaTimes);
     if (omitTrackSampleTable) {
       long editedDurationUs;
-      ImmutableLongArray editListMediaTimes = checkNotNull(track.editListMediaTimes);
-      if (track.editListDurations.length() == 1 && track.editListDurations.get(0) == 0) {
+      if (ignoreBadAudioEdit) {
+        editedDurationUs = durationUs;
+      } else if (track.editListDurations.length() == 1
+          && track.editListDurations.get(0) == 0) {
         long editStartTime = editListMediaTimes.get(0);
         editedDurationUs =
             Util.scaleLargeTimestamp(
@@ -793,10 +798,25 @@ public final class BoxParser {
     // handles simple discarding/delaying of samples. The extractor may place further restrictions
     // on what edited streams are playable.
 
+    if (ignoreBadAudioEdit) {
+      Util.scaleLargeTimestampsInPlace(timestamps, C.MICROS_PER_SECOND, track.timescale);
+      return new TrackSampleTable(
+          track,
+          offsets,
+          sizes,
+          maximumSize,
+          timestamps,
+          flags,
+          syncSampleIndices,
+          hasOnlySyncSamples,
+          durationUs,
+          sampleCount);
+    }
+
     if (track.editListDurations.length() == 1
         && track.type == C.TRACK_TYPE_AUDIO
         && timestamps.length >= 2) {
-      long editStartTime = checkNotNull(track.editListMediaTimes).get(0);
+      long editStartTime = editListMediaTimes.get(0);
       long editEndTime =
           editStartTime
               + Util.scaleLargeTimestamp(
@@ -838,7 +858,7 @@ public final class BoxParser {
       // The current version of the spec leaves handling of an edit with zero segment_duration in
       // unfragmented files open to interpretation. We handle this as a special case and include all
       // samples in the edit.
-      long editStartTime = checkNotNull(track.editListMediaTimes).get(0);
+      long editStartTime = editListMediaTimes.get(0);
       for (int i = 0; i < timestamps.length; i++) {
         timestamps[i] =
             Util.scaleLargeTimestamp(
@@ -871,7 +891,6 @@ public final class BoxParser {
     boolean copyMetadata = false;
     int[] startIndices = new int[track.editListDurations.length()];
     int[] endIndices = new int[track.editListDurations.length()];
-    ImmutableLongArray editListMediaTimes = checkNotNull(track.editListMediaTimes);
     for (int i = 0; i < track.editListDurations.length(); i++) {
       long editMediaTime = editListMediaTimes.get(i);
       if (editMediaTime != -1) {
@@ -1019,6 +1038,24 @@ public final class BoxParser {
       meta.setPosition(atomPosition + atomSize);
     }
     return null;
+  }
+
+  private static boolean hasBadAudioEdit(
+      Track track, long mediaDuration, ImmutableLongArray editListMediaTimes) {
+    if (track.type != C.TRACK_TYPE_AUDIO
+        || checkNotNull(track.editListDurations).length() != 1) {
+      return false;
+    }
+    long editStartTime = editListMediaTimes.get(0);
+    if (editStartTime == -1 || editStartTime >= mediaDuration) {
+      return false;
+    }
+    long editDurationInMediaTimescale =
+        Util.scaleLargeTimestamp(
+            track.editListDurations.get(0), track.timescale, track.movieTimescale);
+    long remainingMediaDuration = mediaDuration - editStartTime;
+    return editDurationInMediaTimescale
+        > remainingMediaDuration + EDIT_LIST_DURATION_TOLERANCE_TIMESCALE_UNITS;
   }
 
   @Nullable
@@ -1298,6 +1335,7 @@ public final class BoxParser {
             out,
             i);
       } else if (childAtomType == Mp4Box.TYPE_mp4a
+          || childAtomType == Mp4Box.TYPE_av3a
           || childAtomType == Mp4Box.TYPE_enca
           || childAtomType == Mp4Box.TYPE_ac_3
           || childAtomType == Mp4Box.TYPE_ec_3
@@ -1531,6 +1569,7 @@ public final class BoxParser {
     // The format of HDR static info is defined in CTA-861-G:2017, Table 45.
     @Nullable ByteBuffer hdrStaticInfo = null;
     @Nullable DolbyVisionConfig dolbyVisionConfig = null;
+    @Nullable byte[] dolbyVisionConfigBytes = null;
 
     while (childPosition - position < size) {
       parent.setPosition(childPosition);
@@ -1669,7 +1708,13 @@ public final class BoxParser {
       } else if (childAtomType == Mp4Box.TYPE_dvcC
           || childAtomType == Mp4Box.TYPE_dvvC
           || childAtomType == Mp4Box.TYPE_dvwC) {
-        dolbyVisionConfig = DolbyVisionConfig.parse(parent);
+        dolbyVisionConfigBytes =
+            parseDolbyVisionConfigBytes(
+                parent,
+                childStartPosition,
+                childAtomSize,
+                /* sampleEntryEndPosition= */ (long) position + size);
+        dolbyVisionConfig = DolbyVisionConfig.parse(new ParsableByteArray(dolbyVisionConfigBytes));
       } else if (childAtomType == Mp4Box.TYPE_vpcC) {
         ExtractorUtil.checkContainerInput(mimeType == null, /* message= */ null);
         mimeType = (atomType == Mp4Box.TYPE_vp08) ? MimeTypes.VIDEO_VP8 : MimeTypes.VIDEO_VP9;
@@ -1842,6 +1887,9 @@ public final class BoxParser {
     if (dolbyVisionConfig != null) {
       mimeType = MimeTypes.VIDEO_DOLBY_VISION;
       codecs = dolbyVisionConfig.codecs;
+      initializationData =
+          CodecSpecificDataUtil.setDolbyVisionCsd(
+              initializationData, checkNotNull(dolbyVisionConfigBytes));
     }
 
     // If the media type was not recognized, ignore the track.
@@ -1892,6 +1940,23 @@ public final class BoxParser {
     }
 
     out.format = formatBuilder.build();
+  }
+
+  /* package */ static byte[] parseDolbyVisionConfigBytes(
+      ParsableByteArray parent,
+      int childStartPosition,
+      int childAtomSize,
+      long sampleEntryEndPosition)
+      throws ParserException {
+    long configurationStartPosition = (long) childStartPosition + Mp4Box.HEADER_SIZE;
+    long configurationEndPosition = (long) childStartPosition + childAtomSize;
+    ExtractorUtil.checkContainerInput(
+        childAtomSize >= Mp4Box.HEADER_SIZE + 4
+            && configurationEndPosition <= sampleEntryEndPosition
+            && configurationEndPosition <= parent.limit(),
+        "Invalid Dolby Vision configuration");
+    return Arrays.copyOfRange(
+        parent.getData(), (int) configurationStartPosition, (int) configurationEndPosition);
   }
 
   /**
@@ -2127,8 +2192,10 @@ public final class BoxParser {
       mimeType = MimeTypes.AUDIO_AC4;
     } else if (atomType == Mp4Box.TYPE_dtsc) {
       mimeType = MimeTypes.AUDIO_DTS;
-    } else if (atomType == Mp4Box.TYPE_dtsh || atomType == Mp4Box.TYPE_dtsl) {
+    } else if (atomType == Mp4Box.TYPE_dtsh) {
       mimeType = MimeTypes.AUDIO_DTS_HD;
+    } else if (atomType == Mp4Box.TYPE_dtsl) {
+      mimeType = MimeTypes.AUDIO_MEDIA3_DTS_HD_MA_CORELESS;
     } else if (atomType == Mp4Box.TYPE_dtse) {
       mimeType = MimeTypes.AUDIO_DTS_EXPRESS;
     } else if (atomType == Mp4Box.TYPE_dtsx) {
@@ -2150,6 +2217,8 @@ public final class BoxParser {
       }
     } else if (atomType == Mp4Box.TYPE__mp2 || atomType == Mp4Box.TYPE__mp3) {
       mimeType = MimeTypes.AUDIO_MPEG;
+    } else if (atomType == Mp4Box.TYPE_av3a) {
+      mimeType = MimeTypes.AUDIO_AV3A;
     } else if (atomType == Mp4Box.TYPE_mha1) {
       mimeType = MimeTypes.AUDIO_MPEGH_MHA1;
     } else if (atomType == Mp4Box.TYPE_mhm1) {
@@ -2254,6 +2323,14 @@ public final class BoxParser {
         parent.setPosition(Mp4Box.HEADER_SIZE + childPosition);
         out.format =
             Ac3Util.parseEAc3AnnexFFormat(parent, Integer.toString(trackId), language, drmInitData);
+      } else if (childAtomType == Mp4Box.TYPE_dca3) {
+        Av3aUtil.Config av3aConfig = Av3aUtil.parseDca3Box(parent, childPosition, childAtomSize);
+        sampleRate = av3aConfig.sampleRate;
+        channelCount = av3aConfig.channelCount;
+        codecs = av3aConfig.codecs;
+        if (av3aConfig.bitrate != Format.NO_VALUE && btrtData == null) {
+          btrtData = new BtrtData(av3aConfig.bitrate, av3aConfig.bitrate);
+        }
       } else if (childAtomType == Mp4Box.TYPE_dac4) {
         parent.setPosition(Mp4Box.HEADER_SIZE + childPosition);
         out.format =

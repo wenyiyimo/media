@@ -58,6 +58,7 @@ import androidx.media3.common.Player.PlaybackSuppressionReason;
 import androidx.media3.common.Player.RepeatMode;
 import androidx.media3.common.Timeline;
 import androidx.media3.common.TrackSelectionParameters;
+import androidx.media3.common.TrackGroup;
 import androidx.media3.common.audio.AudioFocusManager;
 import androidx.media3.common.util.Clock;
 import androidx.media3.common.util.ConditionVariable;
@@ -190,6 +191,8 @@ import java.util.Objects;
   private static final int MSG_SET_SCRUBBING_MODE_PARAMETERS = 38;
   private static final int MSG_SET_IMAGE_METADATA_LISTENER = 39;
   private static final int MSG_SET_AUDIO_SESSION_ID = 40;
+  private static final int MSG_SET_AUDIO_OFFSET = 41;
+  private static final int MSG_SET_TEXT_OFFSET = 42;
 
   private static final long BUFFERING_MAXIMUM_INTERVAL_MS =
       Util.usToMs(Renderer.DEFAULT_DURATION_TO_PROGRESS_US);
@@ -566,6 +569,14 @@ import java.util.Objects;
     }
   }
 
+  public void setAudioOffsetMs(long audioOffsetMs) {
+    handler.obtainMessage(MSG_SET_AUDIO_OFFSET, Long.valueOf(audioOffsetMs)).sendToTarget();
+  }
+
+  public void setTextOffsetMs(long textOffsetMs) {
+    handler.obtainMessage(MSG_SET_TEXT_OFFSET, Long.valueOf(textOffsetMs)).sendToTarget();
+  }
+
   private void handleAudioFocusPlayerCommandInternal(
       @AudioFocusManager.PlayerCommand int playerCommand) throws ExoPlaybackException {
     updatePlayWhenReadyWithAudioFocus(
@@ -864,6 +875,12 @@ import java.util.Objects;
         case MSG_SET_AUDIO_SESSION_ID:
           setAudioSessionIdInternal(msg.arg1);
           break;
+        case MSG_SET_AUDIO_OFFSET:
+          setAudioOffsetMsInternal((Long) checkNotNull(msg.obj));
+          break;
+        case MSG_SET_TEXT_OFFSET:
+          setTextOffsetMsInternal((Long) checkNotNull(msg.obj));
+          break;
         case MSG_AUDIO_FOCUS_PLAYER_COMMAND:
           handleAudioFocusPlayerCommandInternal(/* playerCommand= */ msg.arg1);
           break;
@@ -1158,6 +1175,18 @@ import java.util.Objects;
   private void setAudioSessionIdInternal(int audioSessionId) throws ExoPlaybackException {
     for (RendererHolder renderer : renderers) {
       renderer.setAudioSessionId(audioSessionId);
+    }
+  }
+
+  private void setAudioOffsetMsInternal(long audioOffsetMs) throws ExoPlaybackException {
+    for (RendererHolder renderer : renderers) {
+      renderer.setAudioOffsetMs(audioOffsetMs);
+    }
+  }
+
+  private void setTextOffsetMsInternal(long textOffsetMs) throws ExoPlaybackException {
+    for (RendererHolder renderer : renderers) {
+      renderer.setTextOffsetMs(textOffsetMs);
     }
   }
 
@@ -3606,7 +3635,9 @@ import java.util.Objects;
           playingPeriodHolder == null
               ? emptyTrackSelectorResult
               : playingPeriodHolder.getTrackSelectorResult();
-      staticMetadata = extractMetadataFromTrackSelectionArray(trackSelectorResult.selections);
+      staticMetadata =
+          extractMetadataFromTrackSelectionsOrGroups(
+              trackSelectorResult.selections, trackGroupArray);
       // Ensure the media period queue requested content position matches the new playback info.
       if (playingPeriodHolder != null
           && playingPeriodHolder.info.requestedContentPositionUs != requestedContentPositionUs) {
@@ -3634,14 +3665,14 @@ import java.util.Objects;
         staticMetadata);
   }
 
-  private ImmutableList<Metadata> extractMetadataFromTrackSelectionArray(
-      ExoTrackSelection[] trackSelections) {
+  private ImmutableList<Metadata> extractMetadataFromTrackSelectionsOrGroups(
+      ExoTrackSelection[] trackSelections, TrackGroupArray trackGroupArray) {
     ImmutableList.Builder<Metadata> result = new ImmutableList.Builder<>();
     boolean seenNonEmptyMetadata = false;
     for (ExoTrackSelection trackSelection : trackSelections) {
       if (trackSelection != null) {
         Format format = trackSelection.getFormat(/* index= */ 0);
-        if (format.metadata == null) {
+        if (format.metadata == null || format.metadata.length() == 0) {
           result.add(new Metadata());
         } else {
           result.add(format.metadata);
@@ -3649,7 +3680,20 @@ import java.util.Objects;
         }
       }
     }
-    return seenNonEmptyMetadata ? result.build() : ImmutableList.of();
+    if (seenNonEmptyMetadata) {
+      return result.build();
+    }
+    for (int groupIndex = 0; groupIndex < trackGroupArray.length; groupIndex++) {
+      TrackGroup trackGroup = trackGroupArray.get(groupIndex);
+      for (int trackIndex = 0; trackIndex < trackGroup.length; trackIndex++) {
+        @Nullable Metadata metadata = trackGroup.getFormat(trackIndex).metadata;
+        if (metadata != null && metadata.length() > 0) {
+          result.add(metadata);
+          break;
+        }
+      }
+    }
+    return result.build();
   }
 
   private void enableRenderers() throws ExoPlaybackException {

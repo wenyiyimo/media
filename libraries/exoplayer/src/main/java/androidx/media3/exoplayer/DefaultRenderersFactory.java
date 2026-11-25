@@ -30,6 +30,7 @@ import androidx.annotation.IntDef;
 import androidx.annotation.Nullable;
 import androidx.annotation.RequiresApi;
 import androidx.media3.common.C;
+import androidx.media3.common.DolbyVisionOutputPolicy;
 import androidx.media3.common.MimeTypes;
 import androidx.media3.common.util.ExperimentalApi;
 import androidx.media3.common.util.Log;
@@ -129,6 +130,7 @@ public class DefaultRenderersFactory implements RenderersFactory {
   private long videoRendererEarlySchedulingThresholdUs;
   private boolean enableMediaCodecBufferDecodeOnlyFlag;
   private boolean enableMediaCodecVideoRendererDurationToProgressUs;
+  private @DolbyVisionOutputPolicy.Mode int dolbyVisionOutputPolicy;
 
   /**
    * @param context A {@link Context}.
@@ -142,6 +144,7 @@ public class DefaultRenderersFactory implements RenderersFactory {
     parseAv1SampleDependencies = true;
     lateThresholdToDropDecoderInputUs = DEFAULT_LATE_THRESHOLD_TO_DROP_DECODER_INPUT_US;
     videoRendererEarlySchedulingThresholdUs = DEFAULT_EARLY_SCHEDULING_THRESHOLD_US;
+    dolbyVisionOutputPolicy = DolbyVisionOutputPolicy.AUTO;
   }
 
   /**
@@ -215,6 +218,23 @@ public class DefaultRenderersFactory implements RenderersFactory {
   @CanIgnoreReturnValue
   public final DefaultRenderersFactory setEnableDecoderFallback(boolean enableDecoderFallback) {
     this.enableDecoderFallback = enableDecoderFallback;
+    return this;
+  }
+
+  /**
+   * Sets the policy used to decide whether native Dolby Vision output may be sent to the default
+   * display.
+   *
+   * <p>This policy controls display capability detection. Decoder capability checks and fallback
+   * eligibility still apply. The default is {@link DolbyVisionOutputPolicy#AUTO}.
+   *
+   * @param dolbyVisionOutputPolicy The policy to use.
+   * @return This factory, for convenience.
+   */
+  @CanIgnoreReturnValue
+  public final DefaultRenderersFactory setDolbyVisionOutputPolicy(
+      @DolbyVisionOutputPolicy.Mode int dolbyVisionOutputPolicy) {
+    this.dolbyVisionOutputPolicy = dolbyVisionOutputPolicy;
     return this;
   }
 
@@ -502,6 +522,7 @@ public class DefaultRenderersFactory implements RenderersFactory {
             .setMediaCodecSelector(mediaCodecSelector)
             .setAllowedJoiningTimeMs(allowedVideoJoiningTimeMs)
             .setEnableDecoderFallback(enableDecoderFallback)
+            .setDolbyVisionOutputPolicy(dolbyVisionOutputPolicy)
             .setEventHandler(eventHandler)
             .setEventListener(eventListener)
             .setMaxDroppedFramesToNotify(MAX_DROPPED_VIDEO_FRAME_COUNT_TO_NOTIFY)
@@ -618,13 +639,13 @@ public class DefaultRenderersFactory implements RenderersFactory {
 
     try {
       // LINT.IfChange
-      Class<?> clazz =
-          Class.forName("androidx.media3.decoder.ffmpeg.ExperimentalFfmpegVideoRenderer");
+      Class<?> clazz = Class.forName("androidx.media3.decoder.ffmpeg.FfmpegVideoRenderer");
       // Full class names used for media3 constructor args so the LINT rule triggers if any of them
       // move.
       @SuppressWarnings("UnnecessarilyFullyQualified")
       Constructor<?> constructor =
           clazz.getConstructor(
+              Context.class,
               long.class,
               Handler.class,
               androidx.media3.exoplayer.video.VideoRendererEventListener.class,
@@ -633,6 +654,7 @@ public class DefaultRenderersFactory implements RenderersFactory {
       Renderer renderer =
           (Renderer)
               constructor.newInstance(
+                  context,
                   allowedVideoJoiningTimeMs,
                   eventHandler,
                   eventListener,
@@ -761,29 +783,6 @@ public class DefaultRenderersFactory implements RenderersFactory {
 
     try {
       // LINT.IfChange
-      Class<?> clazz = Class.forName("androidx.media3.decoder.ffmpeg.FfmpegAudioRenderer");
-      // Full class names used for media3 constructor args so the LINT rule triggers if any of them
-      // move.
-      @SuppressWarnings("UnnecessarilyFullyQualified")
-      Constructor<?> constructor =
-          clazz.getConstructor(
-              Handler.class,
-              androidx.media3.exoplayer.audio.AudioRendererEventListener.class,
-              androidx.media3.exoplayer.audio.AudioSink.class);
-      // LINT.ThenChange(../../../../../../proguard-rules.txt)
-      Renderer renderer =
-          (Renderer) constructor.newInstance(eventHandler, eventListener, audioSink);
-      out.add(extensionRendererIndex++, renderer);
-      Log.i(TAG, "Loaded FfmpegAudioRenderer.");
-    } catch (ClassNotFoundException e) {
-      // Expected if the app was built without the extension.
-    } catch (Exception e) {
-      // The extension is present, but instantiation failed.
-      throw new IllegalStateException("Error instantiating FFmpeg extension", e);
-    }
-
-    try {
-      // LINT.IfChange
       Class<?> builderClass =
           Class.forName("androidx.media3.decoder.iamf.IamfAudioRenderer$Builder");
       // Full class names used for media3 constructor args so the LINT rule triggers if any move.
@@ -831,6 +830,29 @@ public class DefaultRenderersFactory implements RenderersFactory {
     } catch (Exception e) {
       // The extension is present, but instantiation failed.
       throw new IllegalStateException("Error instantiating MPEG-H extension", e);
+    }
+
+    try {
+      // LINT.IfChange
+      Class<?> clazz = Class.forName("androidx.media3.decoder.ffmpeg.FfmpegAudioRenderer");
+      // Full class names used for media3 constructor args so the LINT rule triggers if any of them
+      // move.
+      @SuppressWarnings("UnnecessarilyFullyQualified")
+      Constructor<?> constructor =
+          clazz.getConstructor(
+              Handler.class,
+              androidx.media3.exoplayer.audio.AudioRendererEventListener.class,
+              androidx.media3.exoplayer.audio.AudioSink.class);
+      // LINT.ThenChange(../../../../../../proguard-rules.txt)
+      Renderer renderer =
+          (Renderer) constructor.newInstance(eventHandler, eventListener, audioSink);
+      out.add(extensionRendererIndex++, renderer);
+      Log.i(TAG, "Loaded FfmpegAudioRenderer.");
+    } catch (ClassNotFoundException e) {
+      // Expected if the app was built without the extension.
+    } catch (Exception e) {
+      // The extension is present, but instantiation failed.
+      throw new IllegalStateException("Error instantiating FFmpeg extension", e);
     }
   }
 

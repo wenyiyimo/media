@@ -50,9 +50,35 @@ import java.util.Objects;
 @UnstableApi
 public final class DefaultSubtitleParserFactory implements SubtitleParser.Factory {
 
+  private final boolean supportsBitmapSubtitles;
+
+  /** Creates an instance supporting all default subtitle formats. */
+  public DefaultSubtitleParserFactory() {
+    this(/* supportsBitmapSubtitles= */ true);
+  }
+
+  private DefaultSubtitleParserFactory(boolean supportsBitmapSubtitles) {
+    this.supportsBitmapSubtitles = supportsBitmapSubtitles;
+  }
+
+  /**
+   * Creates a factory for parsing subtitles during extraction.
+   *
+   * <p>Bitmap subtitle formats remain encoded so they are only decoded after track selection.
+   */
+  public static SubtitleParser.Factory createForExtraction() {
+    return new DefaultSubtitleParserFactory(/* supportsBitmapSubtitles= */ false);
+  }
+
   @Override
   public boolean supportsFormat(Format format) {
     @Nullable String mimeType = format.sampleMimeType;
+    if (!supportsBitmapSubtitles
+        && (Objects.equals(mimeType, MimeTypes.APPLICATION_PGS)
+            || Objects.equals(mimeType, MimeTypes.APPLICATION_VOBSUB)
+            || Objects.equals(mimeType, MimeTypes.APPLICATION_DVBSUBS))) {
+      return false;
+    }
     return Objects.equals(mimeType, MimeTypes.TEXT_SSA)
         || Objects.equals(mimeType, MimeTypes.TEXT_VTT)
         || Objects.equals(mimeType, MimeTypes.APPLICATION_MP4VTT)
@@ -116,7 +142,7 @@ public final class DefaultSubtitleParserFactory implements SubtitleParser.Factor
         case MimeTypes.APPLICATION_DVBSUBS:
           return new DvbParser(format.initializationData);
         case MimeTypes.APPLICATION_TTML:
-          return new TtmlParser();
+          return new TtmlParser(format.width, format.height);
         default:
           break;
       }

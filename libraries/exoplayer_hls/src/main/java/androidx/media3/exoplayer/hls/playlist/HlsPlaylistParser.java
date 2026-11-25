@@ -40,6 +40,7 @@ import androidx.media3.common.util.Log;
 import androidx.media3.common.util.UnstableApi;
 import androidx.media3.common.util.UriUtil;
 import androidx.media3.common.util.Util;
+import androidx.media3.exoplayer.drm.ClearKeyUtil;
 import androidx.media3.exoplayer.hls.HlsTrackMetadataEntry;
 import androidx.media3.exoplayer.hls.HlsTrackMetadataEntry.VariantInfo;
 import androidx.media3.exoplayer.hls.playlist.HlsMediaPlaylist.Interstitial;
@@ -56,6 +57,7 @@ import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.io.StringReader;
 import java.math.BigDecimal;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -313,13 +315,18 @@ public final class HlsPlaylistParser implements ParsingLoadable.Parser<HlsPlayli
 
   private final HlsMultivariantPlaylist multivariantPlaylist;
   @Nullable private final HlsMediaPlaylist previousMediaPlaylist;
+  private final boolean adblock;
+
+  public HlsPlaylistParser() {
+    this(false);
+  }
 
   /**
    * Creates an instance where media playlists are parsed without inheriting attributes from a
    * multivariant playlist.
    */
-  public HlsPlaylistParser() {
-    this(HlsMultivariantPlaylist.EMPTY, /* previousMediaPlaylist= */ null);
+  public HlsPlaylistParser(boolean adblock) {
+    this(HlsMultivariantPlaylist.EMPTY, /* previousMediaPlaylist= */ null, adblock);
   }
 
   /**
@@ -334,8 +341,25 @@ public final class HlsPlaylistParser implements ParsingLoadable.Parser<HlsPlayli
   public HlsPlaylistParser(
       HlsMultivariantPlaylist multivariantPlaylist,
       @Nullable HlsMediaPlaylist previousMediaPlaylist) {
+    this(multivariantPlaylist, previousMediaPlaylist, /* adblock= */ false);
+  }
+
+  /**
+   * Creates an instance where parsed media playlists inherit attributes from the given multivariant
+   * playlist.
+   *
+   * @param multivariantPlaylist The multivariant playlist from which media playlists will inherit
+   *     attributes.
+   * @param previousMediaPlaylist The previous media playlist from which the new media playlist may
+   *     inherit skipped segments.
+   */
+  public HlsPlaylistParser(
+      HlsMultivariantPlaylist multivariantPlaylist,
+      @Nullable HlsMediaPlaylist previousMediaPlaylist,
+      boolean adblock) {
     this.multivariantPlaylist = multivariantPlaylist;
     this.previousMediaPlaylist = previousMediaPlaylist;
+    this.adblock = adblock;
   }
 
   @Override
@@ -349,6 +373,16 @@ public final class HlsPlaylistParser implements ParsingLoadable.Parser<HlsPlayli
         throw ParserException.createForMalformedManifest(
             /* message= */ "Input does not start with the #EXTM3U header.", /* cause= */ null);
       }
+
+      if (adblock) {
+        StringBuilder sb = new StringBuilder();
+        while ((line = reader.readLine()) != null) {
+          sb.append(line).append("\n");
+        }
+        String m3u8 = HlsAdsParser.process(sb.toString());
+        reader = new BufferedReader(new StringReader(m3u8));
+      }
+
       while ((line = reader.readLine()) != null) {
         line = line.trim();
         if (line.isEmpty()) {
@@ -405,7 +439,8 @@ public final class HlsPlaylistParser implements ParsingLoadable.Parser<HlsPlayli
 
   private static int skipIgnorableWhitespace(BufferedReader reader, boolean skipLinebreaks, int c)
       throws IOException {
-    while (c != -1 && Character.isWhitespace(c) && (skipLinebreaks || !Util.isLinebreak(c))) {
+    while (c == 0xFEFF
+        || (c != -1 && Character.isWhitespace(c) && (skipLinebreaks || !Util.isLinebreak(c)))) {
       c = reader.read();
     }
     return c;
@@ -500,6 +535,12 @@ public final class HlsPlaylistParser implements ParsingLoadable.Parser<HlsPlayli
           String method = parseStringAttr(line, REGEX_METHOD, variableDefinitions, matcherCache);
           String scheme = parseEncryptionScheme(method);
           sessionKeyDrmInitData.add(new DrmInitData(scheme, schemeData));
+          byte[] data = ClearKeyUtil.buildClearKeyPssh(line, schemeData);
+          if (data != null) {
+            sessionKeyDrmInitData.add(
+                new DrmInitData(
+                    scheme, new SchemeData(C.CLEARKEY_UUID, null, MimeTypes.VIDEO_MP4, data)));
+          }
         }
       } else if (line.startsWith(TAG_CONTENT_STEERING)) {
         if (contentSteeringInfo != null) {
@@ -898,7 +939,8 @@ public final class HlsPlaylistParser implements ParsingLoadable.Parser<HlsPlayli
 
     @Nullable DrmInitData playlistProtectionSchemes = null;
     @Nullable String fullSegmentEncryptionKeyUri = null;
-    @Nullable String fullSegmentEncryptionIV = null;
+    @Nullable String sampleEncryptionKeyUri = null;
+    @Nullable String identityEncryptionIV = null;
     TreeMap<String, SchemeData> currentSchemeDatas = new TreeMap<>();
     @Nullable String encryptionScheme = null;
     @Nullable DrmInitData cachedDrmInitData = null;
@@ -949,7 +991,7 @@ public final class HlsPlaylistParser implements ParsingLoadable.Parser<HlsPlayli
           // The segment has no byte range defined.
           segmentByteRangeOffset = 0;
         }
-        if (fullSegmentEncryptionKeyUri != null && fullSegmentEncryptionIV == null) {
+        if (fullSegmentEncryptionKeyUri != null && identityEncryptionIV == null) {
           // See RFC 8216, Section 4.3.2.5.
           throw ParserException.createForMalformedManifest(
               "The encryption IV attribute must be present when an initialization segment is"
@@ -962,7 +1004,7 @@ public final class HlsPlaylistParser implements ParsingLoadable.Parser<HlsPlayli
                 segmentByteRangeOffset,
                 segmentByteRangeLength,
                 fullSegmentEncryptionKeyUri,
-                fullSegmentEncryptionIV);
+                fullSegmentEncryptionKeyUri != null ? identityEncryptionIV : null);
         if (segmentByteRangeLength != C.LENGTH_UNSET) {
           segmentByteRangeOffset += segmentByteRangeLength;
         }
@@ -1040,9 +1082,10 @@ public final class HlsPlaylistParser implements ParsingLoadable.Parser<HlsPlayli
           initializationSegment = segment.initializationSegment;
           cachedDrmInitData = segment.drmInitData;
           fullSegmentEncryptionKeyUri = segment.fullSegmentEncryptionKeyUri;
+          sampleEncryptionKeyUri = segment.sampleEncryptionKeyUri;
           if (segment.encryptionIV == null
               || !segment.encryptionIV.equals(Long.toHexString(segmentMediaSequence))) {
-            fullSegmentEncryptionIV = segment.encryptionIV;
+            identityEncryptionIV = segment.encryptionIV;
           }
           segmentMediaSequence++;
         }
@@ -1052,17 +1095,22 @@ public final class HlsPlaylistParser implements ParsingLoadable.Parser<HlsPlayli
             parseOptionalStringAttr(
                 line, REGEX_KEYFORMAT, KEYFORMAT_IDENTITY, variableDefinitions, matcherCache);
         fullSegmentEncryptionKeyUri = null;
-        fullSegmentEncryptionIV = null;
+        sampleEncryptionKeyUri = null;
+        identityEncryptionIV = null;
         if (METHOD_NONE.equals(method)) {
           currentSchemeDatas.clear();
           cachedDrmInitData = null;
         } else /* !METHOD_NONE.equals(method) */ {
-          fullSegmentEncryptionIV =
-              parseOptionalStringAttr(line, REGEX_IV, variableDefinitions, matcherCache);
           if (KEYFORMAT_IDENTITY.equals(keyFormat)) {
+            identityEncryptionIV =
+                parseOptionalStringAttr(line, REGEX_IV, variableDefinitions, matcherCache);
             if (METHOD_AES_128.equals(method)) {
               // The segment is fully encrypted using an identity key.
               fullSegmentEncryptionKeyUri =
+                  parseStringAttr(line, REGEX_URI, variableDefinitions, matcherCache);
+            } else if (METHOD_SAMPLE_AES.equals(method)) {
+              // The samples are encrypted using an identity key.
+              sampleEncryptionKeyUri =
                   parseStringAttr(line, REGEX_URI, variableDefinitions, matcherCache);
             } else {
               // Do nothing. Samples are encrypted using an identity key, but this is not supported.
@@ -1077,6 +1125,11 @@ public final class HlsPlaylistParser implements ParsingLoadable.Parser<HlsPlayli
             if (schemeData != null) {
               cachedDrmInitData = null;
               currentSchemeDatas.put(keyFormat, schemeData);
+              byte[] data = ClearKeyUtil.buildClearKeyPssh(line, schemeData);
+              if (data != null) {
+                currentSchemeDatas.put(
+                    "clearkey", new SchemeData(C.CLEARKEY_UUID, null, MimeTypes.VIDEO_MP4, data));
+              }
             }
           }
         }
@@ -1133,7 +1186,10 @@ public final class HlsPlaylistParser implements ParsingLoadable.Parser<HlsPlayli
         @Nullable
         String segmentEncryptionIV =
             getSegmentEncryptionIV(
-                segmentMediaSequence, fullSegmentEncryptionKeyUri, fullSegmentEncryptionIV);
+                segmentMediaSequence,
+                fullSegmentEncryptionKeyUri,
+                sampleEncryptionKeyUri,
+                identityEncryptionIV);
         if (cachedDrmInitData == null && !currentSchemeDatas.isEmpty()) {
           SchemeData[] schemeDatas = currentSchemeDatas.values().toArray(new SchemeData[0]);
           cachedDrmInitData = new DrmInitData(encryptionScheme, schemeDatas);
@@ -1152,6 +1208,7 @@ public final class HlsPlaylistParser implements ParsingLoadable.Parser<HlsPlayli
                   partStartTimeUs,
                   cachedDrmInitData,
                   fullSegmentEncryptionKeyUri,
+                  sampleEncryptionKeyUri,
                   segmentEncryptionIV,
                   byteRangeStart != C.LENGTH_UNSET ? byteRangeStart : 0,
                   byteRangeLength,
@@ -1163,7 +1220,10 @@ public final class HlsPlaylistParser implements ParsingLoadable.Parser<HlsPlayli
         @Nullable
         String segmentEncryptionIV =
             getSegmentEncryptionIV(
-                segmentMediaSequence, fullSegmentEncryptionKeyUri, fullSegmentEncryptionIV);
+                segmentMediaSequence,
+                fullSegmentEncryptionKeyUri,
+                sampleEncryptionKeyUri,
+                identityEncryptionIV);
         String url = parseStringAttr(line, REGEX_URI, variableDefinitions, matcherCache);
         long partDurationUs =
             (long) (parseDoubleAttr(line, REGEX_ATTR_DURATION, matcherCache) * C.MICROS_PER_SECOND);
@@ -1204,6 +1264,7 @@ public final class HlsPlaylistParser implements ParsingLoadable.Parser<HlsPlayli
                 partStartTimeUs,
                 cachedDrmInitData,
                 fullSegmentEncryptionKeyUri,
+                sampleEncryptionKeyUri,
                 segmentEncryptionIV,
                 partByteRangeOffset,
                 partByteRangeLength,
@@ -1432,7 +1493,10 @@ public final class HlsPlaylistParser implements ParsingLoadable.Parser<HlsPlayli
         @Nullable
         String segmentEncryptionIV =
             getSegmentEncryptionIV(
-                segmentMediaSequence, fullSegmentEncryptionKeyUri, fullSegmentEncryptionIV);
+                segmentMediaSequence,
+                fullSegmentEncryptionKeyUri,
+                sampleEncryptionKeyUri,
+                identityEncryptionIV);
         segmentMediaSequence++;
         String segmentUri = replaceVariableReferences(line, variableDefinitions, matcherCache);
         @Nullable Segment inferredInitSegment = urlToInferredInitSegment.get(segmentUri);
@@ -1473,6 +1537,7 @@ public final class HlsPlaylistParser implements ParsingLoadable.Parser<HlsPlayli
                 segmentStartTimeUs,
                 cachedDrmInitData,
                 fullSegmentEncryptionKeyUri,
+                sampleEncryptionKeyUri,
                 segmentEncryptionIV,
                 segmentByteRangeOffset,
                 segmentByteRangeLength,
@@ -1567,11 +1632,12 @@ public final class HlsPlaylistParser implements ParsingLoadable.Parser<HlsPlayli
   private static String getSegmentEncryptionIV(
       long segmentMediaSequence,
       @Nullable String fullSegmentEncryptionKeyUri,
-      @Nullable String fullSegmentEncryptionIV) {
-    if (fullSegmentEncryptionKeyUri == null) {
+      @Nullable String sampleEncryptionKeyUri,
+      @Nullable String encryptionIV) {
+    if (fullSegmentEncryptionKeyUri == null && sampleEncryptionKeyUri == null) {
       return null;
-    } else if (fullSegmentEncryptionIV != null) {
-      return fullSegmentEncryptionIV;
+    } else if (encryptionIV != null) {
+      return encryptionIV;
     }
     return Long.toHexString(segmentMediaSequence);
   }
